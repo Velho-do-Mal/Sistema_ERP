@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <title>BK_ERP - Controle de Projetos</title>
+  <style>
+    /* Base visual inspirado no template BK */
+    body{font-family: Arial, Helvetica, sans-serif; margin:0; background:#f5f7fb; color:#111;}
+    .page{max-width:1000px; margin:24px auto; background:#fff; border-radius:14px; box-shadow:0 6px 24px rgba(17,24,39,.08); overflow:hidden;}
+    .header{padding:22px 26px; background:linear-gradient(135deg,#0f172a,#1d4ed8); color:#fff;}
+    .header h1{margin:0; font-size:22px;}
+    .sub{opacity:.9; margin-top:6px; font-size:13px;}
+    .grid{display:grid; grid-template-columns:repeat(4,1fr); gap:12px; padding:18px 26px;}
+    .card{border:1px solid #e5e7eb; border-radius:12px; padding:14px 14px;}
+    .k{font-size:12px; color:#64748b; margin-bottom:6px;}
+    .v{font-size:20px; font-weight:700;}
+    .section{padding:0 26px 22px;}
+    h2{font-size:16px; margin:18px 0 10px;}
+    table{width:100%; border-collapse:collapse; font-size:12px;}
+    th,td{border-bottom:1px solid #e5e7eb; padding:8px 6px; text-align:left; vertical-align:top;}
+    th{background:#f8fafc; font-weight:700;}
+    .badge{display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; font-weight:700; font-size:11px;}
+    .muted{color:#64748b;}
+    .footer{padding:14px 26px; background:#f8fafc; font-size:11px; color:#64748b;}
+    .charts{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
+    .imgbox{border:1px solid #e5e7eb; border-radius:12px; padding:10px;}
+    .imgbox img{width:100%; height:auto; display:block;}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <h1>🖥️ Controle de Projetos</h1>
+      <div class="sub">BK_ERP • {{generated_at}}</div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="k">Projetos</div><div class="v">{{kpi_projetos_total}}</div></div>
+      <div class="card"><div class="k">Projetos em atraso</div><div class="v">{{kpi_projetos_atrasados}}</div></div>
+      <div class="card"><div class="k">Tarefas</div><div class="v">{{kpi_tarefas_total}}</div></div>
+      <div class="card"><div class="k">Tarefas vencidas</div><div class="v">{{kpi_tarefas_atrasadas}}</div></div>
+    </div>
+
+    <div class="section">
+      <h2>Indicadores</h2>
+      <div class="charts">
+        <div class="imgbox">
+          <div class="muted">Projetos por status</div>
+          {{chart_projects_status_svg}}
+        </div>
+        <div class="imgbox">
+          <div class="muted">Tarefas vencidas por responsabilidade</div>
+          {{chart_tasks_overdue_svg}}
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Projetos (com atraso)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Projeto</th>
+            <th>Código</th>
+            <th>Status</th>
+            <th>Início</th>
+            <th>Conclusão prevista</th>
+            <th>Dias atraso</th>
+            <th>Responsabilidade</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{projects_rows}}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h2>Tarefas vencidas</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Projeto</th>
+            <th>Tarefa</th>
+            <th>Conclusão</th>
+            <th>Status</th>
+            <th>Resp.</th>
+            <th>Responsabilidade atraso</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{tasks_rows}}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="footer">
+      Relatório gerado automaticamente pelo BK_ERP.
+    </div>
+  </div>
+</body>
+</html>

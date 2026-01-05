@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Proposta {{PROPOSTA_CODIGO}} - {{CLIENTE_NOME}}</title>
+  <style>
+    /* Base visual inspirada no template BK (fontes/limpeza), pronta para impressão */
+    @page { size: A4; margin: 18mm; }
+    body { font-family: Inter, Arial, sans-serif; color: #111827; }
+    .header { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+    .brand { display:flex; align-items:center; gap:12px; }
+    .brand img { height: 44px; }
+    .brand .name { font-weight: 800; font-size: 18px; letter-spacing: .2px; }
+    .meta { text-align:right; font-size: 12px; color:#374151; }
+    .card { border:1px solid #E5E7EB; border-radius: 14px; padding: 14px 16px; margin-top: 14px; }
+    h1 { font-size: 18px; margin: 0; }
+    h2 { font-size: 13px; margin: 0 0 8px 0; color:#111827; text-transform: uppercase; letter-spacing: .08em; }
+    p { margin: 0 0 10px 0; line-height: 1.45; color:#111827; }
+    .muted { color:#6B7280; }
+    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    table { width:100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border-bottom: 1px solid #E5E7EB; padding: 8px 6px; vertical-align: top; }
+    th { text-align:left; background:#F9FAFB; font-weight: 700; color:#111827; }
+    td.num, th.num { text-align:right; white-space:nowrap; }
+    .totalRow td { font-weight: 800; border-top:2px solid #111827; border-bottom:none; }
+    .badge { display:inline-block; padding:4px 10px; border-radius: 999px; background:#111827; color:#fff; font-size: 11px; font-weight: 700; }
+    .footer { margin-top: 16px; font-size: 11px; color:#6B7280; }
+    .hr { height:1px; background:#E5E7EB; margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="brand">
+      <img src="{{LOGO_DATAURI}}" alt="BK"/>
+      <div>
+        <div class="name">BK Engenharia</div>
+        <div class="muted" style="font-size:12px;">Proposta Comercial / Técnica</div>
+      </div>
+    </div>
+    <div class="meta">
+      <div><span class="badge">{{STATUS}}</span></div>
+      <div style="margin-top:8px;"><b>Proposta:</b> {{PROPOSTA_CODIGO}}</div>
+      <div><b>Data:</b> {{DATA_EMISSAO}}</div>
+      <div><b>Validade:</b> {{VALIDADE}}</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h1>{{TITULO}}</h1>
+    <div class="hr"></div>
+    <div class="grid2">
+      <div>
+        <h2>Contratante</h2>
+        <p><b>{{CLIENTE_NOME}}</b></p>
+        <p class="muted">{{CLIENTE_DOC}}</p>
+        <p class="muted">{{CLIENTE_ENDERECO}}</p>
+      </div>
+      <div>
+        <h2>Projeto / Referência</h2>
+        <p><b>{{REFERENCIA}}</b></p>
+        <p class="muted">{{OBSERVACOES}}</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Objetivo</h2>
+    <p>{{OBJETIVO}}</p>
+
+    <h2>Escopo</h2>
+    <p>{{ESCOPO}}</p>
+  </div>
+
+  <div class="card">
+    <h2>Responsabilidades do Contratante</h2>
+    <p>{{RESP_CONTRATANTE}}</p>
+
+    <h2>Responsabilidades do Contratado</h2>
+    <p>{{RESP_CONTRATADO}}</p>
+  </div>
+
+  <div class="card">
+    <h2>Orçamento</h2>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:52%;">Item</th>
+          <th style="width:10%;">Un.</th>
+          <th class="num" style="width:10%;">Qtd</th>
+          <th class="num" style="width:14%;">V. Unit</th>
+          <th class="num" style="width:14%;">Total</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ITENS_TABELA}}
+        <tr class="totalRow">
+          <td colspan="4" class="num">Total</td>
+          <td class="num">{{TOTAL_GERAL}}</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="hr"></div>
+    <p class="muted"><b>Condições de pagamento:</b> {{PAGAMENTO}}</p>
+    <p class="muted"><b>Prazo/Entrega:</b> {{ENTREGA}}</p>
+  </div>
+
+  <div class="footer">
+    <div><b>BK Engenharia</b> • Documento gerado pelo BK_ERP</div>
+  </div>
+</body>
+</html>

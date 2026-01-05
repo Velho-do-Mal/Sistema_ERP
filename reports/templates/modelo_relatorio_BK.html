@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8">
+    <title>Relatório BK – Estudo de Proteção</title>
+
+    <!-- =========================
+         CSS PADRÃO BK ENGENHARIA
+         ========================= -->
+    <style>
+        body{
+            font-family: Arial, sans-serif;
+            margin:0;
+            padding:0;
+            background:#f4f6fb;
+            color:#222;
+        }
+        header{
+            background:linear-gradient(120deg,#007bff,#00bcd4);
+            color:white;
+            padding:20px 40px;
+        }
+        header h1{
+            margin:0;
+            font-size:26px;
+        }
+        header h2{
+            margin:4px 0 0;
+            font-size:16px;
+            font-weight:normal;
+        }
+        .badge{
+            display:inline-block;
+            margin-top:6px;
+            padding:3px 10px;
+            border-radius:20px;
+            background:#e3f2fd;
+            color:#0d47a1;
+            font-size:11px;
+        }
+        section{
+            margin:20px 40px;
+            background:#ffffff;
+            border-radius:8px;
+            box-shadow:0 2px 8px rgba(0,0,0,0.06);
+            padding:18px 22px;
+        }
+        h3{
+            margin-top:0;
+            color:#0d47a1;
+        }
+        p{
+            font-size:13px;
+            line-height:1.5;
+            margin:6px 0;
+        }
+        table{
+            width:100%;
+            border-collapse:collapse;
+            margin-top:10px;
+            font-size:12px;
+        }
+        th,td{
+            border:1px solid #ddd;
+            padding:6px 8px;
+            text-align:center;
+        }
+        th{
+            background:#e3f2fd;
+        }
+        .tag-ok{
+            display:inline-block;
+            padding:3px 10px;
+            border-radius:20px;
+            background:#e3f2fd;
+            color:#0d47a1;
+            font-size:11px;
+            font-weight:bold;
+        }
+        .tag-nok{
+            display:inline-block;
+            padding:3px 10px;
+            border-radius:20px;
+            background:#ffebee;
+            color:#b71c1c;
+            font-size:11px;
+            font-weight:bold;
+        }
+        .footer{
+            text-align:center;
+            padding:15px;
+            font-size:12px;
+            color:#555;
+        }
+    </style>
+</head>
+
+<body>
+
+<!-- =========================
+     CABEÇALHO FIXO
+     ========================= -->
+<header>
+    <h1>BK – Estudo de Proteção e Dimensionamento</h1>
+    <h2>Curto-circuito, cabos, barramentos, equipamentos e coordenação</h2>
+    <span class="badge">BK Engenharia e Tecnologia</span>
+</header>
+
+<!-- =========================
+     SEÇÕES DINÂMICAS
+     ========================= -->
+
+{{DADOS_GERAIS}}
+
+{{CABOS_PRIMARIO}}
+
+{{CABOS_SECUNDARIO}}
+
+{{LINHAS_CHEGADA}}
+
+{{LINHA_SAIDA}}
+
+{{BARRAMENTO}}
+
+{{EQUIPAMENTOS_PRIMARIO}}
+
+{{EQUIPAMENTOS_SECUNDARIO}}
+
+{{ALIMENTADORES}}
+
+{{RELES}}
+
+{{COORDENOGRAMAS}}
+
+<!-- =========================
+     RODAPÉ FIXO
+     ========================= -->
+<div class="footer">
+    Relatório técnico gerado automaticamente<br>
+    BK Engenharia e Tecnologia
+</div>
+
+</body>
+</html>
