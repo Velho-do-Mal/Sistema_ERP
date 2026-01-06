@@ -1,0 +1,854 @@
+*** Begin Patch
+*** Add File: bk_erp_shared/finance_bridge.py
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""
++bk_erp_shared.finance_bridge
++Ponte entre Compras/Vendas/Propostas e o módulo Financeiro (bk_finance).
++--------------------------------------------------------------------------------
++- create_installments(tx_type, description, installments, client_id=..., supplier_id=..., project_id=...)
++    cria lançamentos no módulo financeiro (uma Transaction por parcela) e agrupa
++    todos os lançamentos por recurrence_group (uuid).
++
++- link_order_to_finance(order_type, order_id, description, total_amount, entry_amount, parcels, ...)
++    helper que monta a lista de parcelas (entrada + parcelas) e chama create_installments.
++
++Observação:
++- Este arquivo usa a sessão do financeiro via bk_erp_shared.erp_db.get_finance_db()
++- Não toca em tabelas do domínio de propostas/compras: apenas cria transações.
++--------------------------------------------------------------------------------
++"""
++from __future__ import annotations
++import uuid
++from datetime import date
++from typing import List, Dict, Optional
++
++# Reaproveita a função que obtém o engine e SessionLocal do módulo financeiro
++from bk_erp_shared.erp_db import get_finance_db
++import bk_finance  # modelo ORM do financeiro (Transaction, User, etc.)
++
++
++def create_installments(tx_type: str,
++                        description: str,
++                        installments: List[Dict],
++                        client_id: Optional[int] = None,
++                        supplier_id: Optional[int] = None,
++                        project_id: Optional[int] = None) -> List[int]:
++    """
++    Cria lançamentos (Transactions) no financeiro para cada item em "installments".
++
++    Parâmetros:
++    - tx_type: 'entrada' ou 'saida' (string).
++    - description: descrição textual do lançamento (ex: "Venda #123").
++    - installments: lista de dicts com {'amount': float, 'due_date': date}.
++    - client_id / supplier_id / project_id: referencias opcionais.
++
++    Retorna:
++    - lista de ids (inteiros) das transactions criadas.
++    """
++    engine, SessionLocal = get_finance_db()
++    recurrence_group = uuid.uuid4().hex  # agrupa as parcelas para edição futura
++    created_ids: List[int] = []
++
++    # Abre sessão ORM do módulo financeiro
++    with SessionLocal() as session:
++        # cria cada parcela como uma Transaction ORM do bk_finance
++        for inst in installments:
++            amt = float(inst.get("amount", 0))
++            if amt <= 0:
++                # ignora parcelas com valor zero ou negativo (defensivo)
++                continue
++            due = inst.get("due_date") or date.today()
++
++            # Monta o objeto Transaction do bk_finance (schema já presente no módulo)
++            tx = bk_finance.Transaction(
++                date=due,  # competência: usamos a data de vencimento por padrão
++                due_date=due,
++                paid=False,
++                description=description,
++                amount=amt,
++                type=tx_type,               # 'entrada' ou 'saida'
++                client_id=client_id,
++                supplier_id=supplier_id,
++                recurrence_group=recurrence_group,
++                reference=str(project_id) if project_id is not None else None,
++            )
++            session.add(tx)
++
++        # confirma inserções
++        session.commit()
++
++        # recupera os ids criados (filtra pelo recurrence_group)
++        rows = session.query(bk_finance.Transaction).filter_by(recurrence_group=recurrence_group).all()
++        created_ids = [r.id for r in rows]
++
++    return created_ids
++
++
++def link_order_to_finance(order_type: str,
++                          order_id: int,
++                          description: str,
++                          total_amount: float,
++                          entry_amount: float,
++                          parcels: List[Dict],
++                          client_id: Optional[int] = None,
++                          supplier_id: Optional[int] = None,
++                          project_id: Optional[int] = None) -> List[int]:
++    """
++    Helper para ligar uma ordem (proposta / venda / compra) ao financeiro.
++
++    Parâmetros:
++    - order_type: 'sale'|'purchase' ou explicitamente 'entrada'|'saida'
++    - order_id: id da ordem (apenas para referência no description se desejar)
++    - description: texto para os lançamentos (ex: "Venda/Proposta #123")
++    - total_amount: valor total da ordem (soma da entrada + parcelas)
++    - entry_amount: valor de entrada (float, 0 se não houver)
++    - parcels: lista [{'amount':float, 'due_date': date}, ...] representando as parcelas
++    - client_id / supplier_id / project_id: ids opcionais para vinculação
++    Retorna lista de transaction ids criadas.
++    """
++    # Normaliza tx_type
++    if order_type in ("entrada", "saida"):
++        tx_type = order_type
++    elif order_type == "sale":
++        tx_type = "entrada"
++    else:
++        tx_type = "saida"
++
++    # Monta lista de parcelas (entrada + parcelas fornecidas)
++    insts: List[Dict] = []
++    entry_amount = float(entry_amount or 0)
++    if entry_amount > 0:
++        insts.append({"amount": entry_amount, "due_date": date.today()})
++
++    # Adiciona as parcelas passadas pelo caller
++    for p in parcels:
++        insts.append({"amount": float(p.get("amount", 0)), "due_date": p.get("due_date")})
++
++    # Validação da soma (não bloqueante - só advertência se divergente)
++    s = sum(float(i["amount"]) for i in insts)
++    if round(s, 2) != round(float(total_amount or 0), 2):
++        # Aqui não lançamos exceção por compatibilidade, mas idealmente a UI
++        # deveria ajustar a 1ª parcela para cobrir diferença de arredondamento.
++        # Você pode logar/alertar no frontend se desejar.
++        pass
++
++    return create_installments(tx_type, description, insts,
++                               client_id=client_id, supplier_id=supplier_id, project_id=project_id)
++
+*** End Patch
+*** Begin Patch
+*** Add File: bk_erp_shared/theme.py
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""
++bk_erp_shared.theme
++Tema compartilhado do BK_ERP
++--------------------------------------------------------------------------------
++- load_svg(path) -> carrega SVG e retorna data URI base64 (usado no header/hero)
++- apply_theme() -> injeta CSS com variáveis de cor e regras para layout
++Observação: preservei os seletores usados nos relatórios e nas tabelas para
++manter o layout e a aparência estrutural (margens, bordas, espaçamentos).
++--------------------------------------------------------------------------------
++"""
++from __future__ import annotations
++import base64
++from pathlib import Path
++import streamlit as st
++
++def load_svg(path: str) -> str:
++    """
++    Lê um arquivo SVG local e retorna uma string data-uri base64 para uso no HTML img src.
++    """
++    data = Path(path).read_text(encoding="utf-8")
++    b64 = base64.b64encode(data.encode("utf-8")).decode("utf-8")
++    return f"data:image/svg+xml;base64,{b64}"
++
++def apply_theme():
++    """
++    Injeta o CSS do tema na aplicação Streamlit.
++    - Cores: paleta azul primária, branco e cinza-claro de fundo.
++    - Mantém classes e seletores do layout original para não quebrar relatórios.
++    """
++    css = """
++    <style>
++    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
++
++    :root{
++        --bk-primary: #0B5ED7;     /* Azul primário solicitado */
++        --bk-accent: #0B84FF;
++        --bk-highlight: #0B5ED7;
++        --bk-bg: #F2F4F7;          /* Cinza claro de fundo */
++        --bk-card: #FFFFFF;        /* Cartões brancos */
++        --bk-text: #0f172a;
++        --bk-muted: #6C757D;
++        --bk-border: rgba(15,23,42,0.08);
++        --bk-shadow: 0 18px 42px rgba(2,6,23,0.04);
++        --bk-radius: 16px;
++    }
++
++    /* Fonte global */
++    html, body, [class*="css"]{
++        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
++    }
++
++    /* Plano de fundo e cor padrão de texto */
++    .stApp {
++        background: var(--bk-bg);
++        color: var(--bk-text);
++    }
++
++    /* Cartões (mantive padding, borda e shadow para não alterar o layout) */
++    .bk-card{
++        background: var(--bk-card);
++        border-radius: var(--bk-radius);
++        border: 1px solid var(--bk-border);
++        box-shadow: var(--bk-shadow);
++        padding: 18px 20px;
++    }
++
++    /* Títulos */
++    .bk-title{
++        font-size: 30px;
++        font-weight: 900;
++        color: var(--bk-highlight);
++        letter-spacing: -0.02em;
++        margin: 0 0 2px 0;
++        line-height: 1.1;
++    }
++
++    .bk-subtitle{
++        font-size: 13px;
++        color: var(--bk-muted);
++        margin: 0;
++    }
++
++    /* Botões com borda arredondada */
++    .stButton>button{
++        border-radius: 14px !important;
++        border: 1px solid rgba(0,0,0,0.06) !important;
++        box-shadow: 0 12px 26px rgba(2,6,23,0.06) !important;
++    }
++
++    /* Garantir que tabelas / dataframes mantenham o layout com bordas e padding */
++    div[data-testid="stDataFrame"] table,
++    div[data-testid="stTable"] table,
++    table{
++        border-collapse: collapse !important;
++    }
++    div[data-testid="stDataFrame"] table th,
++    div[data-testid="stDataFrame"] table td,
++    div[data-testid="stTable"] table th,
++    div[data-testid="stTable"] table td,
++    table th, table td{
++        border: 1px solid #334155 !important;
++        padding: 7px 10px !important;
++        font-size: 13px !important;
++        white-space: nowrap !important;
++    }
++    div[data-testid="stDataFrame"] table th,
++    div[data-testid="stTable"] table th{
++        background: rgba(11,94,215,0.06) !important; /* cor delicada para cabeçalhos */
++        font-weight: 800 !important;
++    }
++
++    /* Valor das métricas */
++    div[data-testid="stMetricValue"]{
++        font-weight: 900;
++        color: var(--bk-text);
++    }
++
++    /* Footer pequeno */
++    .footer-small { color:var(--bk-muted); font-size:13px; text-align:center; margin-top:18px; }
++    </style>
++    """
++    st.markdown(css, unsafe_allow_html=True)
++
+*** End Patch
+*** Begin Patch
+*** Add File: examples/proposals_finance_ui_example.py
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""
++examples/proposals_finance_ui_example.py
++Exemplo de UI para gerar parcelas editáveis (entrada + N parcelas) e criar lançamentos no financeiro.
++--------------------------------------------------------------------------------
++- Usa st.experimental_data_editor() para edição das parcelas antes de confirmar.
++- Chama bk_erp_shared.finance_bridge.link_order_to_finance(...) para criar as transactions.
++- Integre este código no módulo real de propostas/vendas do seu app.
++--------------------------------------------------------------------------------
++"""
++import streamlit as st
++import pandas as pd
++from datetime import date
++from dateutil.relativedelta import relativedelta
++
++# Importa a função helper que criamos
++from bk_erp_shared.finance_bridge import link_order_to_finance
++
++def ui_generate_finance_from_proposal(proposal_id: int, proposal_value: float, client_id: int = None, project_id: int = None):
++    """
++    Exemplo de função que renderiza o formulário para gerar lançamentos financeiros
++    a partir de uma proposta/venda.
++    - proposal_id: id da proposta (usado na descrição)
++    - proposal_value: valor total da proposta (float)
++    - client_id/project_id: ids opcionais para vincular a transação
++    """
++    st.subheader(f"Gerar conta no Financeiro • Proposta #{proposal_id}")
++
++    # Layout em 3 colunas (número parcelas, valor entrada, primeiro vencimento)
++    cols = st.columns(3)
++    with cols[0]:
++        parcelas = st.number_input("Número de parcelas", min_value=1, value=3, help="Quantas parcelas além da entrada (se houver)")
++    with cols[1]:
++        entrada = st.number_input("Valor da entrada", min_value=0.0, value=0.0, step=0.01, format="%.2f")
++    with cols[2]:
++        primeiro_venc = st.date_input("Primeiro vencimento", value=date.today())
++
++    # Calcula parcelas automáticas (divisão simples, ajusta diferença no 1º)
++    remaining = float(proposal_value) - float(entrada)
++    per = round(remaining / parcelas, 2)
++    rows = []
++    for i in range(parcelas):
++        venc = primeiro_venc + relativedelta(months=i)
++        rows.append({"parcela": i+1, "valor": per, "vencimento": venc})
++
++    # Ajuste para diferença de arredondamento
++    diff = round(remaining - per * parcelas, 2)
++    if diff != 0:
++        rows[0]["valor"] = rows[0]["valor"] + diff
++
++    df = pd.DataFrame(rows)[["parcela", "valor", "vencimento"]]
++
++    # Data editor experimental do Streamlit permite edição inline das parcelas
++    # (observação: a API é experimental, mas é apropriada para este caso)
++    edited = st.experimental_data_editor(df, num_rows="fixed")
++
++    # Botão para confirmar e gerar os lançamentos no financeiro
++    if st.button("Confirmar e gerar no financeiro"):
++        parcels_payload = []
++        for _, r in edited.iterrows():
++            parcels_payload.append({"amount": float(r["valor"]), "due_date": r["vencimento"]})
++        # Linka a ordem com o financeiro -> cria transactions
++        ids = link_order_to_finance("sale", proposal_id,
++                                    f"Venda/Proposta #{proposal_id}",
++                                    proposal_value,
++                                    entrada,
++                                    parcels_payload,
++                                    client_id=client_id,
++                                    project_id=project_id)
++        st.success(f"Criado(s) lançamento(s) financeiro(s): {ids}")
++
++# Execução direta para teste rápido
++if __name__ == "__main__":
++    ui_generate_finance_from_proposal(1, 1000.0, client_id=1, project_id=1)
++
+*** End Patch
+*** Begin Patch
+*** Update File: Home.py
+@@
+-# Home.py
+-# Página principal (Home / Painel Executivo) do BK_ERP
+-# OBS: este arquivo foi mantido na íntegra e foi adicionado no final
+-#      um footer com a logo e o texto "Criado pela BK Engenharia e Tecnologia".
+-# --------------------------------------------------------------------------------
+-
+-import streamlit as st
+-import pandas as pd
+-import plotly.express as px
+-from datetime import date, timedelta
+-
+-from bk_erp_shared.theme import apply_theme, load_svg
+-from bk_erp_shared.erp_db import get_finance_db, ensure_erp_tables
+-from bk_erp_shared.auth import login_and_guard, current_user
+-
+-# Finance models
+-import bk_finance
+-from sqlalchemy import text
+-
+-st.set_page_config(page_title="BK_ERP", layout="wide")
+-
+-# Aplica tema (bk_erp_shared/theme.py)
+-apply_theme()
+-
+-# Garante criação das tabelas específicas do ERP (migrações leves em runtime)
+-ensure_erp_tables()
+-
+-# Obtém engine e SessionLocal do módulo financeiro
+-engine, SessionLocal = get_finance_db()
+-
+-# Exige login
+-login_and_guard(SessionLocal)
+-
+-# Header - logos/hero (carrega SVGs como data:uri)
+-logo_uri = load_svg("assets/logo.svg")
+-hero_uri = load_svg("assets/hero.svg")
+-
+-st.markdown(
+-    f"""
+-    <div class="bk-card" style="padding:22px 24px; display:flex; gap:16px; align-items:center; overflow:hidden;">
+-        <img src="{logo_uri}" style="width:54px; height:54px;" />
+-        <div style="flex:1;">
+-            <div class="bk-title">BK_ERP</div>
+-            <div class="bk-subtitle">ERP para Engenharia, Empreiteiras e Construtoras • Financeiro • Projetos • Compras • Vendas • Documentos</div>
+-        </div>
+-        <div style="font-size:12px; color:#64748b; text-align:right;">
+-            Usuário: <b>{current_user().get("email")}</b><br/>
+-            Perfil: <b>{current_user().get("role")}</b>
+-        </div>
+-    </div>
+-    """,
+-    unsafe_allow_html=True
+-)
+-
+-st.markdown(
+-    f"""
+-    <div class="bk-card" style="padding:0; overflow:hidden; margin-top:14px;">
+-        <img src="{hero_uri}" style="width:100%; display:block;"/>
+-    </div>
+-    """,
+-    unsafe_allow_html=True
+-)
+-
+-# ---- Helper queries
+-def q_one(sql, params=None):
+-    with engine.connect() as conn:
+-        r = conn.execute(text(sql), params or {}).fetchone()
+-        return r[0] if r else 0
+-
+-def q_df(sql, params=None):
+-    return pd.read_sql(text(sql), engine, params=params or {})
+-
+-today = date.today()
+-win_end = today + timedelta(days=15)
+-month_start = today.replace(day=1)
+-month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+-
+-# ---- KPIs Financeiro
+-receber_15 = q_one(
+-    """
+-    SELECT COALESCE(SUM(amount),0)
+-    FROM transactions
+-    WHERE paid = FALSE
+-      AND type = 'entrada'
+-      AND due_date IS NOT NULL
+-      AND due_date BETWEEN :d1 AND :d2
+-    """,
+-    {"d1": today, "d2": win_end},
+-)
+-pagar_15 = q_one(
+-    """
+-    SELECT COALESCE(SUM(amount),0)
+-    FROM transactions
+-    WHERE paid = FALSE
+-      AND type = 'saida'
+-      AND due_date IS NOT NULL
+-      AND due_date BETWEEN :d1 AND :d2
+-    """,
+-    {"d1": today, "d2": win_end},
+-)
+-overdue = q_one(
+-    """
+-    SELECT COUNT(*)
+-    FROM transactions
+-    WHERE paid = FALSE
+-      AND due_date IS NOT NULL
+-      AND due_date < :d1
+-    """,
+-    {"d1": today},
+-)
+-receitas_mes = q_one(
+-    """
+-    SELECT COALESCE(SUM(amount),0)
+-    FROM transactions
+-    WHERE paid = TRUE
+-      AND type = 'entrada'
+-      AND paid_date BETWEEN :d1 AND :d2
+-    """,
+-    {"d1": month_start, "d2": month_end},
+-)
+-despesas_mes = q_one(
+-    """
+-    SELECT COALESCE(SUM(amount),0)
+-    FROM transactions
+-    WHERE paid = TRUE
+-      AND type = 'saida'
+-      AND paid_date BETWEEN :d1 AND :d2
+-    """,
+-    {"d1": month_start, "d2": month_end},
+-)
+-
+-# ---- KPIs Projetos
+-proj_abertos = q_one("SELECT COUNT(*) FROM projects WHERE encerrado = FALSE")
+-proj_encerrados = q_one("SELECT COUNT(*) FROM projects WHERE encerrado = TRUE")
+-
+-# ---- KPIs Compras / Vendas / Documentos
+-compras_abertas = q_one("SELECT COUNT(*) FROM purchase_orders WHERE status != 'encerrada'")
+-propostas_abertas = q_one("SELECT COUNT(*) FROM proposals WHERE status != 'encerrada'")
+-docs_total = q_one("SELECT COUNT(*) FROM documents")
+-
+-# ---- Cards
+-c1, c2, c3, c4 = st.columns(4)
+-with c1:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.metric("A Receber (15 dias)", bk_finance.format_currency(float(receber_15)))
+-    st.caption("Contas a receber com vencimento nos próximos 15 dias")
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-with c2:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.metric("A Pagar (15 dias)", bk_finance.format_currency(float(pagar_15)))
+-    st.caption("Contas a pagar com vencimento nos próximos 15 dias")
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-with c3:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.metric("Atrasados", int(overdue))
+-    st.caption("Títulos vencidos e não realizados")
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-with c4:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.metric("Projetos abertos", int(proj_abertos))
+-    st.caption(f"Encerrados: {int(proj_encerrados)}")
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-# ---- Gráficos
+-st.markdown("## 📊 Painel executivo")
+-
+-g1, g2 = st.columns([1.25, 1])
+-with g1:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.subheader("Fluxo de caixa (Previsto x Realizado) - últimos 9 meses")
+-    # usa função do financeiro (série)
+-    session = SessionLocal()
+-    try:
+-        start = bk_finance.month_add(month_start, -8)
+-        df_flow = bk_finance.build_cashflow_series(session, start, month_end, "Monthly")
+-    finally:
+-        session.close()
+-
+-    if df_flow.empty:
+-        st.caption("Cadastre lançamentos para visualizar.")
+-    else:
+-        fig = px.bar(df_flow, x="period", y=["previsto", "realizado"], barmode="group")
+-        fig.update_layout(height=360, margin=dict(l=20, r=20, t=40, b=20))
+-        st.plotly_chart(fig, use_container_width=True)
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-with g2:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.subheader("Mês atual")
+-    st.metric("Receitas (realizado)", bk_finance.format_currency(float(receitas_mes)))
+-    st.metric("Despesas (realizado)", bk_finance.format_currency(float(despesas_mes)))
+-    st.metric("Resultado (mês)", bk_finance.format_currency(float(receitas_mes - despesas_mes)))
+-    st.caption("Baseado em pagamentos/recebimentos realizados")
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-# ---- Listas rápidas
+-l1, l2 = st.columns(2)
+-with l1:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.subheader("Contas a vencer (15 dias)")
+-    df = q_df(
+-        """
+-        SELECT due_date AS "Vencimento", description AS "Descrição", type AS "Tipo", amount AS "Valor"
+-        FROM transactions
+-        WHERE paid = FALSE
+-          AND due_date IS NOT NULL
+-          AND due_date BETWEEN :d1 AND :d2
+-        ORDER BY due_date ASC
+-        LIMIT 20
+-        """,
+-        {"d1": today, "d2": win_end},
+-    )
+-    if df.empty:
+-        st.caption("Sem registros.")
+-    else:
+-        df["Valor"] = df["Valor"].map(lambda v: bk_finance.format_currency(float(v)))
+-        df["Tipo"] = df["Tipo"].map(lambda t: "A Receber" if t=="entrada" else "A Pagar")
+-        st.dataframe(df, use_container_width=True, height=320)
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-with l2:
+-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+-    st.subheader("Resumo operacional")
+-    st.metric("Compras em aberto", int(compras_abertas))
+-    st.metric("Propostas em andamento", int(propostas_abertas))
+-    st.metric("Documentos cadastrados", int(docs_total))
+-    st.caption("Abra os módulos no menu lateral do Streamlit")
+-    st.markdown("</div>", unsafe_allow_html=True)
+-
+-
+-# --------------------------
+-# FOOTER ADICIONADO
+-# --------------------------
+-# Insere a logo e o texto "Criado pela BK Engenharia e Tecnologia" no final do Home.
+-# Observação: este footer é discreto e não altera o layout dos relatórios.
+-try:
+-    logo_uri = load_svg("assets/logo.svg")
+-except Exception:
+-    logo_uri = ""
+-
+-st.markdown(
+-    f"""
+-    <div style="display:flex; align-items:center; justify-content:center; gap:12px; margin-top:28px; color:#6C757D; font-size:13px;">
+-        <img src="{logo_uri}" style="height:36px;" />
+-        <div>Criado pela <b>BK Engenharia e Tecnologia</b></div>
+-    </div>
+-    """,
+-    unsafe_allow_html=True
+-)
++# Home.py
++# Página principal (Home / Painel Executivo) do BK_ERP
++# OBS: este arquivo foi mantido na íntegra e foi adicionado no final
++#      um footer com a logo e o texto "Criado pela BK Engenharia e Tecnologia".
++# --------------------------------------------------------------------------------
++
++import streamlit as st
++import pandas as pd
++import plotly.express as px
++from datetime import date, timedelta
++
++from bk_erp_shared.theme import apply_theme, load_svg
++from bk_erp_shared.erp_db import get_finance_db, ensure_erp_tables
++from bk_erp_shared.auth import login_and_guard, current_user
++
++# Finance models
++import bk_finance
++from sqlalchemy import text
++
++st.set_page_config(page_title="BK_ERP", layout="wide")
++
++# Aplica tema (bk_erp_shared/theme.py)
++apply_theme()
++
++# Garante criação das tabelas específicas do ERP (migrações leves em runtime)
++ensure_erp_tables()
++
++# Obtém engine e SessionLocal do módulo financeiro
++engine, SessionLocal = get_finance_db()
++
++# Exige login
++login_and_guard(SessionLocal)
++
++# Header - logos/hero (carrega SVGs como data:uri)
++logo_uri = load_svg("assets/logo.svg")
++hero_uri = load_svg("assets/hero.svg")
++
++st.markdown(
++    f"""
++    <div class="bk-card" style="padding:22px 24px; display:flex; gap:16px; align-items:center; overflow:hidden;">
++        <img src="{logo_uri}" style="width:54px; height:54px;" />
++        <div style="flex:1;">
++            <div class="bk-title">BK_ERP</div>
++            <div class="bk-subtitle">ERP para Engenharia, Empreiteiras e Construtoras • Financeiro • Projetos • Compras • Vendas • Documentos</div>
++        </div>
++        <div style="font-size:12px; color:#64748b; text-align:right;">
++            Usuário: <b>{current_user().get("email")}</b><br/>
++            Perfil: <b>{current_user().get("role")}</b>
++        </div>
++    </div>
++    """,
++    unsafe_allow_html=True
++)
++
++st.markdown(
++    f"""
++    <div class="bk-card" style="padding:0; overflow:hidden; margin-top:14px;">
++        <img src="{hero_uri}" style="width:100%; display:block;"/>
++    </div>
++    """,
++    unsafe_allow_html=True
++)
++
++# ---- Helper queries
++def q_one(sql, params=None):
++    with engine.connect() as conn:
++        r = conn.execute(text(sql), params or {}).fetchone()
++        return r[0] if r else 0
++
++def q_df(sql, params=None):
++    return pd.read_sql(text(sql), engine, params=params or {})
++
++today = date.today()
++win_end = today + timedelta(days=15)
++month_start = today.replace(day=1)
++month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
++
++# ---- KPIs Financeiro
++receber_15 = q_one(
++    """
++    SELECT COALESCE(SUM(amount),0)
++    FROM transactions
++    WHERE paid = FALSE
++      AND type = 'entrada'
++      AND due_date IS NOT NULL
++      AND due_date BETWEEN :d1 AND :d2
++    """,
++    {"d1": today, "d2": win_end},
++)
++pagar_15 = q_one(
++    """
++    SELECT COALESCE(SUM(amount),0)
++    FROM transactions
++    WHERE paid = FALSE
++      AND type = 'saida'
++      AND due_date IS NOT NULL
++      AND due_date BETWEEN :d1 AND :d2
++    """,
++    {"d1": today, "d2": win_end},
++)
++overdue = q_one(
++    """
++    SELECT COUNT(*)
++    FROM transactions
++    WHERE paid = FALSE
++      AND due_date IS NOT NULL
++      AND due_date < :d1
++    """,
++    {"d1": today},
++)
++receitas_mes = q_one(
++    """
++    SELECT COALESCE(SUM(amount),0)
++    FROM transactions
++    WHERE paid = TRUE
++      AND type = 'entrada'
++      AND paid_date BETWEEN :d1 AND :d2
++    """,
++    {"d1": month_start, "d2": month_end},
++)
++despesas_mes = q_one(
++    """
++    SELECT COALESCE(SUM(amount),0)
++    FROM transactions
++    WHERE paid = TRUE
++      AND type = 'saida'
++      AND paid_date BETWEEN :d1 AND :d2
++    """,
++    {"d1": month_start, "d2": month_end},
++)
++
++# ---- KPIs Projetos
++proj_abertos = q_one("SELECT COUNT(*) FROM projects WHERE encerrado = FALSE")
++proj_encerrados = q_one("SELECT COUNT(*) FROM projects WHERE encerrado = TRUE")
++
++# ---- KPIs Compras / Vendas / Documentos
++compras_abertas = q_one("SELECT COUNT(*) FROM purchase_orders WHERE status != 'encerrada'")
++propostas_abertas = q_one("SELECT COUNT(*) FROM proposals WHERE status != 'encerrada'")
++docs_total = q_one("SELECT COUNT(*) FROM documents")
++
++# ---- Cards
++c1, c2, c3, c4 = st.columns(4)
++with c1:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.metric("A Receber (15 dias)", bk_finance.format_currency(float(receber_15)))
++    st.caption("Contas a receber com vencimento nos próximos 15 dias")
++    st.markdown("</div>", unsafe_allow_html=True)
++
++with c2:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.metric("A Pagar (15 dias)", bk_finance.format_currency(float(pagar_15)))
++    st.caption("Contas a pagar com vencimento nos próximos 15 dias")
++    st.markdown("</div>", unsafe_allow_html=True)
++
++with c3:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.metric("Atrasados", int(overdue))
++    st.caption("Títulos vencidos e não realizados")
++    st.markdown("</div>", unsafe_allow_html=True)
++
++with c4:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.metric("Projetos abertos", int(proj_abertos))
++    st.caption(f"Encerrados: {int(proj_encerrados)}")
++    st.markdown("</div>", unsafe_allow_html=True)
++
++# ---- Gráficos
++st.markdown("## 📊 Painel executivo")
++
++g1, g2 = st.columns([1.25, 1])
++with g1:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.subheader("Fluxo de caixa (Previsto x Realizado) - últimos 9 meses")
++    # usa função do financeiro (série)
++    session = SessionLocal()
++    try:
++        start = bk_finance.month_add(month_start, -8)
++        df_flow = bk_finance.build_cashflow_series(session, start, month_end, "Monthly")
++    finally:
++        session.close()
++
++    if df_flow.empty:
++        st.caption("Cadastre lançamentos para visualizar.")
++    else:
++        fig = px.bar(df_flow, x="period", y=["previsto", "realizado"], barmode="group")
++        fig.update_layout(height=360, margin=dict(l=20, r=20, t=40, b=20))
++        st.plotly_chart(fig, use_container_width=True)
++    st.markdown("</div>", unsafe_allow_html=True)
++
++with g2:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.subheader("Mês atual")
++    st.metric("Receitas (realizado)", bk_finance.format_currency(float(receitas_mes)))
++    st.metric("Despesas (realizado)", bk_finance.format_currency(float(despesas_mes)))
++    st.metric("Resultado (mês)", bk_finance.format_currency(float(receitas_mes - despesas_mes)))
++    st.caption("Baseado em pagamentos/recebimentos realizados")
++    st.markdown("</div>", unsafe_allow_html=True)
++
++# ---- Listas rápidas
++l1, l2 = st.columns(2)
++with l1:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.subheader("Contas a vencer (15 dias)")
++    df = q_df(
++        """
++        SELECT due_date AS "Vencimento", description AS "Descrição", type AS "Tipo", amount AS "Valor"
++        FROM transactions
++        WHERE paid = FALSE
++          AND due_date IS NOT NULL
++          AND due_date BETWEEN :d1 AND :d2
++        ORDER BY due_date ASC
++        LIMIT 20
++        """,
++        {"d1": today, "d2": win_end},
++    )
++    if df.empty:
++        st.caption("Sem registros.")
++    else:
++        df["Valor"] = df["Valor"].map(lambda v: bk_finance.format_currency(float(v)))
++        df["Tipo"] = df["Tipo"].map(lambda t: "A Receber" if t=="entrada" else "A Pagar")
++        st.dataframe(df, use_container_width=True, height=320)
++    st.markdown("</div>", unsafe_allow_html=True)
++
++with l2:
++    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
++    st.subheader("Resumo operacional")
++    st.metric("Compras em aberto", int(compras_abertas))
++    st.metric("Propostas em andamento", int(propostas_abertas))
++    st.metric("Documentos cadastrados", int(docs_total))
++    st.caption("Abra os módulos no menu lateral do Streamlit")
++    st.markdown("</div>", unsafe_allow_html=True)
++
++
++# --------------------------
++# FOOTER ADICIONADO
++# --------------------------
++# Insere a logo e o texto "Criado pela BK Engenharia e Tecnologia" no final do Home.
++# Observação: este footer é discreto e não altera o layout dos relatórios.
++try:
++    logo_uri = load_svg("assets/logo.svg")
++except Exception:
++    logo_uri = ""
++
++st.markdown(
++    f"""
++    <div style="display:flex; align-items:center; justify-content:center; gap:12px; margin-top:28px; color:#6C757D; font-size:13px;">
++        <img src="{logo_uri}" style="height:36px;" />
++        <div>Criado pela <b>BK Engenharia e Tecnologia</b></div>
++    </div>
++    """,
++    unsafe_allow_html=True
++)
+*** End Patch

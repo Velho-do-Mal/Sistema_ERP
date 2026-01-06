@@ -1,10 +1,10 @@
-"""
-BK_ERP - 🖥️ Controle de Projetos (centralizador)
-
-Correções:
-- NÃO importa bk_erp_shared.project_control (evita ImportError por divergência de versão)
-- Mantém tudo necessário aqui: lista projetos, edita campos de controle, tarefas, relatório HTML.
-"""
+# pages/6_🖥️_Controle_de_Projetos.py
+# Página: Controle de Projetos (centralizador)
+# Observações:
+# - Corrigi a inicialização do DB/Session: agora usa bk_erp_shared.erp_db.get_finance_db()
+#   (essa função retorna (SessionLocal, engine) e isola a dependência do módulo de financeiro).
+# - Usa bk_erp_shared.auth.login_and_guard para o login (coerente com o restante do app).
+# - Mantive a lógica original de projeto/tarefas/relatório.
 from __future__ import annotations
 
 from datetime import date
@@ -14,8 +14,13 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 
+# Import local compartilhado
+from bk_erp_shared.erp_db import ensure_erp_tables, get_finance_db
+from bk_erp_shared.auth import login_and_guard
+
+# Observação: mantive a importação de bk_finance caso outras funções do módulo sejam usadas
+# mas não precisamos chamar get_finance_db diretamente do bk_finance.
 import bk_finance
-from bk_erp_shared.erp_db import ensure_erp_tables
 
 
 def _ensure_tasks_table(SessionLocal) -> None:
@@ -140,12 +145,12 @@ def mark_done(SessionLocal, task_id: int) -> None:
 
 
 def _get_renderer():
-    # Import lazy e seguro: não quebra se houver arquivo velho
+    # Import lazy e seguro: não quebra se houver arquivo antigo ou erro no renderizador.
     try:
         from reports.render_controle_projetos import build_report  # type: ignore
         return build_report
     except Exception:
-        # fallback mínimo
+        # fallback mínimo idêntico ao original: constrói um HTML simples (compatível)
         def _fallback(SessionLocal, project_id=None):
             tpl_path = Path("reports/templates/controle_projetos_BK.html")
             tpl = tpl_path.read_text(encoding="utf-8") if tpl_path.exists() else "<html><body>{{content}}</body></html>"
@@ -159,11 +164,16 @@ def _get_renderer():
 
 
 def main():
+    # Page config
     st.set_page_config(page_title="Controle de Projetos", page_icon="🖥️", layout="wide")
     ensure_erp_tables()
 
-    SessionLocal, _engine = bk_finance.get_finance_db()
-    bk_finance.login_and_guard(SessionLocal)
+    # <-- CORREÇÃO PRINCIPAL -->
+    # Obtém SessionLocal e engine pela função compartilhada
+    SessionLocal, _engine = get_finance_db()
+    # Usa o wrapper de autenticação do pacote compartilhado para manter comportamento uniforme
+    login_and_guard(SessionLocal)
+    # ----------------------------->
 
     st.title("🖥️ Controle de Projetos")
     df = list_projects(SessionLocal)

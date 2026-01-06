@@ -1,3 +1,8 @@
+# Home.py
+# Página principal (Home / Painel Executivo) do BK_ERP
+# OBS: este arquivo foi mantido na íntegra e foi adicionado no final
+#      um footer com a logo e o texto "Criado pela BK Engenharia e Tecnologia".
+# --------------------------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -14,13 +19,19 @@ from sqlalchemy import text
 
 st.set_page_config(page_title="BK_ERP", layout="wide")
 
+# Aplica tema (bk_erp_shared/theme.py)
 apply_theme()
+
+# Garante criação das tabelas específicas do ERP (migrações leves em runtime)
 ensure_erp_tables()
 
+# Obtém engine e SessionLocal do módulo financeiro
 engine, SessionLocal = get_finance_db()
+
+# Exige login
 login_and_guard(SessionLocal)
 
-# Header
+# Header - logos/hero (carrega SVGs como data:uri)
 logo_uri = load_svg("assets/logo.svg")
 hero_uri = load_svg("assets/hero.svg")
 
@@ -97,7 +108,6 @@ overdue = q_one(
     """,
     {"d1": today},
 )
-
 receitas_mes = q_one(
     """
     SELECT COALESCE(SUM(amount),0)
@@ -219,3 +229,24 @@ with l2:
     st.metric("Documentos cadastrados", int(docs_total))
     st.caption("Abra os módulos no menu lateral do Streamlit")
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+# --------------------------
+# FOOTER ADICIONADO
+# --------------------------
+# Insere a logo e o texto "Criado pela BK Engenharia e Tecnologia" no final do Home.
+# Observação: este footer é discreto e não altera o layout dos relatórios.
+try:
+    logo_uri = load_svg("assets/logo.svg")
+except Exception:
+    logo_uri = ""
+
+st.markdown(
+    f"""
+    <div style="display:flex; align-items:center; justify-content:center; gap:12px; margin-top:28px; color:#6C757D; font-size:13px;">
+        <img src="{logo_uri}" style="height:36px;" />
+        <div>Criado pela <b>BK Engenharia e Tecnologia</b></div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)

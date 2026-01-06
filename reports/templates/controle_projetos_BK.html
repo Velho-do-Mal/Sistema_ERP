@@ -7,7 +7,7 @@
     /* Base visual inspirado no template BK */
     body{font-family: Arial, Helvetica, sans-serif; margin:0; background:#f5f7fb; color:#111;}
     .page{max-width:1000px; margin:24px auto; background:#fff; border-radius:14px; box-shadow:0 6px 24px rgba(17,24,39,.08); overflow:hidden;}
-    .header{padding:22px 26px; background:linear-gradient(135deg,#0f172a,#1d4ed8); color:#fff;}
+    .header{padding:22px 26px; background:linear-gradient(135deg,#0f172a,#1d4ed8); color:#fff; display:flex; align-items:center; gap:12px;}
     .header h1{margin:0; font-size:22px;}
     .sub{opacity:.9; margin-top:6px; font-size:13px;}
     .grid{display:grid; grid-template-columns:repeat(4,1fr); gap:12px; padding:18px 26px;}
@@ -21,7 +21,7 @@
     th{background:#f8fafc; font-weight:700;}
     .badge{display:inline-block; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; font-weight:700; font-size:11px;}
     .muted{color:#64748b;}
-    .footer{padding:14px 26px; background:#f8fafc; font-size:11px; color:#64748b;}
+    .footer{padding:14px 26px; background:#f8fafc; font-size:11px; color:#64748b; display:flex; justify-content:space-between; align-items:center;}
     .charts{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
     .imgbox{border:1px solid #e5e7eb; border-radius:12px; padding:10px;}
     .imgbox img{width:100%; height:auto; display:block;}
@@ -30,8 +30,17 @@
 <body>
   <div class="page">
     <div class="header">
-      <h1>🖥️ Controle de Projetos</h1>
-      <div class="sub">BK_ERP • {{generated_at}}</div>
+      <!-- Logo injetada via placeholder (data-uri) -->
+      <div style="display:flex; align-items:center;">
+        {{logo_img}}
+      </div>
+      <div style="flex:1;">
+        <h1>🖥️ Controle de Projetos</h1>
+        <div class="sub">BK_ERP • {{generated_at}}</div>
+      </div>
+      <div style="text-align:right; font-size:12px; opacity:0.95;">
+        Relatório
+      </div>
     </div>
 
     <div class="grid">
@@ -97,7 +106,8 @@
     </div>
 
     <div class="footer">
-      Relatório gerado automaticamente pelo BK_ERP.
+      <div>Relatório gerado automaticamente pelo BK_ERP.</div>
+      <div style="font-weight:600;">{{created_by_text}}</div>
     </div>
   </div>
 </body>

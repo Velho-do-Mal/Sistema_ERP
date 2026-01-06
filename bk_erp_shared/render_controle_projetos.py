@@ -1,170 +1,164 @@
-"""
-BK_ERP - Relatório de Controle de Projetos (sem matplotlib)
-
-Este arquivo NÃO depende de matplotlib. Ele gera gráficos simples em SVG embutidos no HTML.
-"""
+# reports/render_controle_projetos.py
+# Gerador de HTML do relatório de Controle de Projetos
+# Observações:
+# - Agora injeta a logo (assets/logo.svg) como data-uri base64 no template através do placeholder {{logo_img}}.
+# - Adiciona o texto "Criado pela BK Engenharia e Tecnologia" no rodapé via {{created_by_text}}.
 from __future__ import annotations
 
-from datetime import date, datetime
-from pathlib import Path
-from typing import Any, Optional
+import base64
+from datetime import datetime, date
+from io import BytesIO
+from typing import Dict, Any
 
 import pandas as pd
-from sqlalchemy import text
-
-TEMPLATE_PATH = Path("reports/templates/controle_projetos_BK.html")
-
-
-def _svg_bar(values: list[tuple[str, float]], width: int = 560, min_height: int = 140) -> str:
-    if not values:
-        return "<svg width='560' height='80'><text x='10' y='30' font-size='14'>Sem dados</text></svg>"
-    maxv = max(v for _, v in values) or 1.0
-
-    pad = 14
-    bar_h = 18
-    gap = 8
-    n = len(values)
-    height = max(min_height, pad * 2 + n * (bar_h + gap))
-    x_label = 170
-    usable = width - x_label - pad
-
-    def esc(s: str) -> str:
-        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    parts = [f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' xmlns='http://www.w3.org/2000/svg'>"]
-    parts.append(f"<rect x='0' y='0' width='{width}' height='{height}' fill='white'/>")
-    y = pad
-    for label, v in values:
-        bw = int(usable * (float(v) / maxv))
-        parts.append(f"<text x='{pad}' y='{y+13}' font-size='12' fill='#111827'>{esc(label)[:32]}</text>")
-        parts.append(f"<rect x='{x_label}' y='{y}' width='{usable}' height='{bar_h}' rx='6' fill='#EEF2FF'/>")
-        parts.append(f"<rect x='{x_label}' y='{y}' width='{bw}' height='{bar_h}' rx='6' fill='#2563EB'/>")
-        parts.append(f"<text x='{x_label + bw + 8}' y='{y+13}' font-size='12' fill='#111827'>{float(v):.0f}</text>")
-        y += bar_h + gap
-    parts.append("</svg>")
-    return "".join(parts)
+import matplotlib.pyplot as plt
+from pathlib import Path
 
 
-def _fmt_date(x: Any) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, (datetime, date)):
-        return x.strftime("%d/%m/%Y")
-    try:
-        dt = pd.to_datetime(x, errors="coerce")
-        if pd.isna(dt):
-            return ""
-        return dt.strftime("%d/%m/%Y")
-    except Exception:
-        return str(x)
+def _fig_to_b64(fig) -> str:
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def build_report(SessionLocal, project_id: Optional[int] = None) -> str:
-    tpl = TEMPLATE_PATH.read_text(encoding="utf-8") if TEMPLATE_PATH.exists() else "<html><body>{{content}}</body></html>"
+def chart_projects_status(projects: pd.DataFrame) -> str:
+    if projects.empty:
+        fig = plt.figure()
+        plt.text(0.5, 0.5, "Sem dados", ha="center", va="center")
+        plt.axis("off")
+        return _fig_to_b64(fig)
+    s = projects["status"].fillna("sem status").astype(str).str.lower()
+    counts = s.value_counts().sort_values(ascending=False)
+    fig = plt.figure()
+    plt.bar(counts.index, counts.values)
+    plt.xticks(rotation=35, ha="right")
+    plt.ylabel("Qtd")
+    plt.title("Projetos por status")
+    return _fig_to_b64(fig)
 
-    with SessionLocal() as conn:
-        where = "WHERE 1=1"
-        if project_id:
-            where += " AND id=:pid"
 
-        projects = pd.read_sql(
-            text(
-                f"""
-                SELECT id,
-                       COALESCE(nome,'(sem nome)') AS nome,
-                       COALESCE(status,'') AS status,
-                       planned_end_date,
-                       actual_end_date,
-                       COALESCE(progress_pct,0) AS progress_pct,
-                       COALESCE(delay_responsibility,'N/A') AS delay_responsibility
-                FROM projects
-                {where}
-                ORDER BY id DESC
-                """
-            ),
-            conn,
-            params={"pid": project_id} if project_id else None,
+def chart_tasks_overdue(tasks: pd.DataFrame) -> str:
+    if tasks.empty:
+        fig = plt.figure()
+        plt.text(0.5, 0.5, "Sem dados", ha="center", va="center")
+        plt.axis("off")
+        return _fig_to_b64(fig)
+
+    today = date.today()
+    t = tasks.copy()
+    # campo/data podem variar; tentamos um mapeamento defensivo
+    if "data_conclusao" in t.columns:
+        t["due"] = pd.to_datetime(t["data_conclusao"], errors="coerce").dt.date
+    elif "due_date" in t.columns:
+        t["due"] = pd.to_datetime(t["due_date"], errors="coerce").dt.date
+    else:
+        t["due"] = pd.NaT
+
+    overdue = t[(t["due"].notna()) & (t["due"] < today) & (t.get("status_tarefa", "").fillna("").str.lower() != "concluida")]
+    if overdue.empty:
+        fig = plt.figure()
+        plt.text(0.5, 0.5, "Sem tarefas vencidas", ha="center", va="center")
+        plt.axis("off")
+        return _fig_to_b64(fig)
+
+    grp = overdue.get("atraso_responsabilidade", pd.Series()).fillna("não informado").astype(str).str.upper().value_counts()
+    fig = plt.figure()
+    plt.bar(grp.index, grp.values)
+    plt.ylabel("Qtd")
+    plt.title("Tarefas vencidas por responsabilidade")
+    return _fig_to_b64(fig)
+
+
+def render_html(template_html: str, context: Dict[str, Any]) -> str:
+    out = template_html
+    for k, v in context.items():
+        out = out.replace("{{" + k + "}}", str(v))
+    return out
+
+
+def make_rows_projects(projects_overdue: pd.DataFrame) -> str:
+    def badge(x: str) -> str:
+        return f'<span class="badge">{x}</span>'
+
+    rows = []
+    for _, r in projects_overdue.iterrows():
+        rows.append(
+            "<tr>"
+            f"<td>{r.get('id','')}</td>"
+            f"<td>{r.get('nome','')}</td>"
+            f"<td>{r.get('cod_projeto','') or ''}</td>"
+            f"<td>{badge(r.get('status','') or '')}</td>"
+            f"<td>{r.get('data_inicio','') or ''}</td>"
+            f"<td>{r.get('data_conclusao','') or ''}</td>"
+            f"<td>{int(r.get('dias_atraso',0) or 0)}</td>"
+            f"<td>{(r.get('atraso_responsabilidade') or '').upper()}</td>"
+            "</tr>"
         )
+    return "\n".join(rows) if rows else '<tr><td colspan="8" class="muted">Sem projetos em atraso.</td></tr>'
 
-        try:
-            tasks = pd.read_sql(
-                text(
-                    """
-                    SELECT project_id,
-                           COALESCE(title,'') AS title,
-                           due_date,
-                           COALESCE(is_done,FALSE) AS is_done,
-                           COALESCE(delay_responsibility,'N/A') AS delay_responsibility
-                    FROM project_tasks
-                    """
-                ),
-                conn,
-            )
-        except Exception:
-            tasks = pd.DataFrame(columns=["project_id", "title", "due_date", "is_done", "delay_responsibility"])
 
-    total = int(len(projects))
-    hoje = pd.Timestamp.today().normalize()
-    atrasados = 0
-    if not projects.empty and "planned_end_date" in projects.columns:
-        planned = pd.to_datetime(projects["planned_end_date"], errors="coerce")
-        actual = pd.to_datetime(projects.get("actual_end_date"), errors="coerce")
-        atrasados = int(((planned < hoje) & (actual.isna())).sum())
+def make_rows_tasks(tasks_overdue: pd.DataFrame, project_name_by_id: Dict[int, str]) -> str:
+    def badge(x: str) -> str:
+        return f'<span class="badge">{x}</span>'
 
-    status_counts = (
-        projects.assign(status=projects["status"].fillna("").replace("", "Sem status"))
-        .groupby("status")["id"]
-        .count()
-        .sort_values(ascending=False)
-        .head(10)
-    )
-    svg_status = _svg_bar([(k, float(v)) for k, v in status_counts.items()], min_height=170)
+    rows = []
+    for _, r in tasks_overdue.iterrows():
+        pid = r.get("project_id")
+        pname = project_name_by_id.get(int(pid), "") if pid and str(pid).isdigit() else ""
+        rows.append(
+            "<tr>"
+            f"<td>{r.get('id','')}</td>"
+            f"<td>{pname}</td>"
+            f"<td>{r.get('title','')}</td>"
+            f"<td>{r.get('data_conclusao','') or ''}</td>"
+            f"<td>{badge(r.get('status_tarefa','') or '')}</td>"
+            f"<td>{r.get('id_responsavel','') or ''}</td>"
+            f"<td>{(r.get('atraso_responsabilidade') or 'não informado').upper()}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows) if rows else '<tr><td colspan="7" class="muted">Sem tarefas vencidas.</td></tr>'
 
-    svg_tasks = "<svg width='560' height='80'><text x='10' y='30' font-size='14'>Sem tarefas</text></svg>"
-    if not tasks.empty and "due_date" in tasks.columns:
-        due = pd.to_datetime(tasks["due_date"], errors="coerce")
-        is_done = tasks["is_done"].fillna(False).astype(bool)
-        overdue = tasks[(due.notna()) & (due < hoje) & (~is_done)]
-        if not overdue.empty:
-            by_resp = (
-                overdue.assign(delay_responsibility=overdue["delay_responsibility"].fillna("N/A").replace("", "N/A"))
-                .groupby("delay_responsibility")["title"]
-                .count()
-                .sort_values(ascending=False)
-            )
-            svg_tasks = _svg_bar([(k, float(v)) for k, v in by_resp.items()], min_height=140)
 
-    rows = ""
-    for _, r in projects.head(25).iterrows():
-        rows += "<tr>"
-        rows += f"<td>{int(r['id'])}</td>"
-        rows += f"<td>{r.get('nome','')}</td>"
-        rows += f"<td>{r.get('status','')}</td>"
-        rows += f"<td>{_fmt_date(r.get('planned_end_date'))}</td>"
-        rows += f"<td>{_fmt_date(r.get('actual_end_date'))}</td>"
-        rows += f"<td>{float(r.get('progress_pct') or 0):.0f}%</td>"
-        rows += f"<td>{r.get('delay_responsibility','N/A')}</td>"
-        rows += "</tr>"
-
-    content = f"""
-    <div class="kpi-row">
-      <div class="kpi"><div class="kpi-label">Projetos</div><div class="kpi-value">{total}</div></div>
-      <div class="kpi"><div class="kpi-label">Em atraso</div><div class="kpi-value">{atrasados}</div></div>
-      <div class="kpi"><div class="kpi-label">Gerado em</div><div class="kpi-value" style="font-size:16px">{datetime.now().strftime("%d/%m/%Y %H:%M")}</div></div>
-    </div>
-
-    <h2>Status dos Projetos</h2>
-    <div class="chart">{svg_status}</div>
-
-    <h2>Tarefas vencidas por responsabilidade</h2>
-    <div class="chart">{svg_tasks}</div>
-
-    <h2>Projetos (últimos)</h2>
-    <table class="table">
-      <thead>
-        <tr><th>ID</th><th>Projeto</th><th>Status</th><th>Previsto</th><th>Real</th><th>Progresso</th><th>Resp. atraso</th></tr>
-      </thead>
-      <tbody>{rows}</tbody>
-    </table>
+def _load_logo_datauri() -> str:
     """
-    return tpl.replace("{{content}}", content).replace("{{generated_at}}", datetime.now().strftime("%d/%m/%Y %H:%M"))
+    Carrega assets/logo.svg e retorna um <img> HTML (data-uri) para injeção direta no template.
+    Se não houver o arquivo, retorna string vazia.
+    """
+    p = Path("assets/logo.svg")
+    if not p.exists():
+        return ""
+    svg = p.read_text(encoding="utf-8")
+    b64 = base64.b64encode(svg.encode("utf-8")).decode("utf-8")
+    datauri = f"data:image/svg+xml;base64,{b64}"
+    # retorno em HTML (img tag) para facilitar o template
+    return f'<img src="{datauri}" style="height:42px; display:inline-block; vertical-align:middle; margin-right:12px;" alt="BK logo"/>'
+
+def build_report(template_html: str, projects: pd.DataFrame, tasks: pd.DataFrame, projects_overdue: pd.DataFrame, tasks_overdue: pd.DataFrame) -> str:
+    """
+    Recebe:
+    - template_html: o conteúdo do arquivo HTML (string) com placeholders
+    - projects, tasks, projects_overdue, tasks_overdue: DataFrames com os dados
+    Retorna o HTML final com gráficos embutidos e logo.
+    """
+    status_b64 = chart_projects_status(projects)
+    overdue_b64 = chart_tasks_overdue(tasks)
+
+    proj_map = {int(r["id"]): str(r.get("nome") or "") for _, r in projects.iterrows() if str(r.get("id","")).isdigit()}
+
+    ctx = {
+        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "kpi_projetos_total": len(projects),
+        "kpi_projetos_atrasados": len(projects_overdue),
+        "kpi_tarefas_total": len(tasks),
+        "kpi_tarefas_atrasadas": len(tasks_overdue),
+        # Inserimos SVGs em <img> para template
+        "chart_projects_status_svg": f'<img src="data:image/png;base64,{status_b64}" alt="projs status" />',
+        "chart_tasks_overdue_svg": f'<img src="data:image/png;base64,{overdue_b64}" alt="tarefas vencidas" />',
+        "projects_rows": make_rows_projects(projects_overdue),
+        "tasks_rows": make_rows_tasks(tasks_overdue, proj_map),
+        # Logo e texto de rodapé
+        "logo_img": _load_logo_datauri(),
+        "created_by_text": "Criado pela BK Engenharia e Tecnologia",
+    }
+    return render_html(template_html, ctx)
