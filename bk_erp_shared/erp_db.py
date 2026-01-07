@@ -176,6 +176,7 @@ def ensure_erp_tables() -> None:
             title TEXT NOT NULL,
             client_id INTEGER NULL,
             lead_id INTEGER NULL,
+            project_id INTEGER NULL,
             value_total {money} DEFAULT 0,
             status TEXT DEFAULT 'rascunho',
             created_at {ts} DEFAULT CURRENT_TIMESTAMP,
@@ -226,6 +227,7 @@ def ensure_erp_tables() -> None:
             id {id_col},
             proposal_id INTEGER NULL,
             client_id INTEGER NULL,
+            project_id INTEGER NULL,
             order_date TEXT,
             value_total {money} DEFAULT 0,
             status TEXT DEFAULT 'aberta',
@@ -299,6 +301,7 @@ def ensure_erp_tables() -> None:
             ADD COLUMN IF NOT EXISTS delivery_terms TEXT,
             ADD COLUMN IF NOT EXISTS reference TEXT,
             ADD COLUMN IF NOT EXISTS observations TEXT,
+            ADD COLUMN IF NOT EXISTS project_id INTEGER,
             ADD COLUMN IF NOT EXISTS updated_at {ts};
         """)
 
@@ -319,6 +322,7 @@ def ensure_erp_tables() -> None:
             "reference": "TEXT",
             "observations": "TEXT",
             "updated_at": ts,
+            "project_id": "INTEGER",
         }
         with engine.begin() as conn:
             existing = [r[1] for r in conn.execute(text("PRAGMA table_info(proposals)"))]
@@ -359,7 +363,25 @@ def ensure_erp_tables() -> None:
                 conn.execute(text("UPDATE leads SET value_estimate = 0 WHERE value_estimate IS NULL"))
             except Exception:
                 pass
-    # Ajustes de colunas (quando a tabela já existe, ex.: criada pelo módulo de Projetos)
+    
+    # Migração: garantir colunas em sales_orders (project_id)
+    if dialect == "sqlite":
+        with engine.begin() as conn:
+            try:
+                existing = {row[1] for row in conn.execute(text("PRAGMA table_info(sales_orders)"))}
+                if "project_id" not in existing:
+                    conn.execute(text('ALTER TABLE sales_orders ADD COLUMN "project_id" INTEGER'))
+            except Exception:
+                pass
+    else:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text("ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS project_id INTEGER"))
+            except Exception:
+                pass
+
+
+# Ajustes de colunas (quando a tabela já existe, ex.: criada pelo módulo de Projetos)
     if dialect != "sqlite":
         with engine.begin() as conn:
             try:
@@ -382,6 +404,7 @@ def ensure_erp_tables() -> None:
                     "valor_total": money,
                     "ativo": bool_t,
                     "updated_at": ts,
+            "project_id": "INTEGER",
                 }
                 for col, ctype in cols.items():
                     if col not in existing:
@@ -402,6 +425,7 @@ def ensure_erp_tables() -> None:
                     "approved_by": "INTEGER",
                     "approved_at": ts,
                     "updated_at": ts,
+            "project_id": "INTEGER",
                 }
                 for col, ctype in cols.items():
                     if col not in existing:

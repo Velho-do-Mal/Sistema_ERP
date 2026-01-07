@@ -53,9 +53,11 @@ def list_proposals(conn) -> pd.DataFrame:
     return pd.read_sql(
         text("""
             SELECT p.id, p.code, p.title, p.client_id, c.name AS client_name,
+                   p.project_id, prj.nome AS project_name,
                    p.value_total, p.status, p.created_at, p.valid_until
             FROM proposals p
             LEFT JOIN clients c ON c.id = p.client_id
+            LEFT JOIN projects prj ON prj.id = p.project_id
             ORDER BY p.created_at DESC, p.id DESC
         """),
         conn
@@ -80,13 +82,24 @@ def get_proposal(conn, proposal_id: int) -> Dict[str, Any]:
     return {"proposal": dict(p), "items": items}
 
 
+
 def save_proposal(conn, proposal: Dict[str, Any]) -> int:
+    """Cria/atualiza proposta. Retorna proposal_id.
+
+    Compatível com Postgres e SQLite:
+    - Postgres: usa RETURNING id
+    - SQLite: usa last_insert_rowid()
+    """
+    dialect = getattr(getattr(conn, "engine", None), "dialect", None)
+    dialect_name = getattr(dialect, "name", "")
+
     # proposta básica
     if proposal.get("id"):
         conn.execute(
             text("""
                 UPDATE proposals
                 SET code=:code, title=:title, client_id=:client_id, lead_id=:lead_id,
+                    project_id=:project_id,
                     value_total=:value_total, status=:status, valid_until=:valid_until,
                     notes=:notes, objective=:objective, scope=:scope,
                     resp_contratante=:resp_contratante, resp_contratado=:resp_contratado,
@@ -98,20 +111,42 @@ def save_proposal(conn, proposal: Dict[str, Any]) -> int:
             proposal
         )
         return int(proposal["id"])
-    else:
-        r = conn.execute(
+
+    # Insert
+    if dialect_name == "sqlite":
+        conn.execute(
             text("""
                 INSERT INTO proposals
-                    (code, title, client_id, lead_id, value_total, status, valid_until, notes,
-                     objective, scope, resp_contratante, resp_contratado, payment_terms, delivery_terms)
+                    (code, title, client_id, lead_id, project_id, value_total, status, valid_until, notes,
+                     objective, scope, resp_contratante, resp_contratado, payment_terms, delivery_terms,
+                     reference, observations)
                 VALUES
-                    (:code, :title, :client_id, :lead_id, :value_total, :status, :valid_until, :notes,
-                     :objective, :scope, :resp_contratante, :resp_contratado, :payment_terms, :delivery_terms, :reference, :observations)
-                RETURNING id
+                    (:code, :title, :client_id, :lead_id, :project_id, :value_total, :status, :valid_until, :notes,
+                     :objective, :scope, :resp_contratante, :resp_contratado, :payment_terms, :delivery_terms,
+                     :reference, :observations)
             """),
             proposal
         )
-        return int(r.scalar())
+        new_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+        return int(new_id)
+
+    # Postgres (ou outros com RETURNING)
+    r = conn.execute(
+        text("""
+            INSERT INTO proposals
+                (code, title, client_id, lead_id, project_id, value_total, status, valid_until, notes,
+                 objective, scope, resp_contratante, resp_contratado, payment_terms, delivery_terms,
+                 reference, observations)
+            VALUES
+                (:code, :title, :client_id, :lead_id, :project_id, :value_total, :status, :valid_until, :notes,
+                 :objective, :scope, :resp_contratante, :resp_contratado, :payment_terms, :delivery_terms,
+                 :reference, :observations)
+            RETURNING id
+        """),
+        proposal
+    )
+    return int(r.scalar())
+
 
 
 def replace_proposal_items(conn, proposal_id: int, items_df: pd.DataFrame) -> None:
@@ -147,12 +182,32 @@ def compute_items_totals(items_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
 def next_proposal_code(conn) -> str:
-    # BK-PROP-YYYY-XXXX
+    """Gera código BK-PROP-YYYY-XXXX.
+
+    - Postgres: usa date_trunc
+    - SQLite: usa strftime('%Y', created_at)
+    """
     year = date.today().year
-    r = conn.execute(text("""
-        SELECT COUNT(*) FROM proposals
-        WHERE created_at >= date_trunc('year', CURRENT_TIMESTAMP)
-    """)).scalar() or 0
+    dialect = getattr(getattr(conn, "engine", None), "dialect", None)
+    dialect_name = getattr(dialect, "name", "")
+
+    if dialect_name == "sqlite":
+        r = conn.execute(
+            text("""
+                SELECT COUNT(*) FROM proposals
+                WHERE strftime('%Y', created_at) = :y
+            """),
+            {"y": str(year)},
+        ).scalar() or 0
+    else:
+        r = conn.execute(
+            text("""
+                SELECT COUNT(*) FROM proposals
+                WHERE created_at >= date_trunc('year', CURRENT_TIMESTAMP)
+            """)
+        ).scalar() or 0
+
     seq = int(r) + 1
     return f"BK-PROP-{year}-{seq:04d}"

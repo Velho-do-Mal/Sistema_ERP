@@ -239,6 +239,9 @@ class Transaction(Base):
     cost_center_id = Column(Integer, ForeignKey("cost_centers.id"), nullable=True)
     cost_center = relationship("CostCenter")
 
+    # BK_ERP integration: link transactions to a project (optional; no FK for portability)
+    project_id = Column(Integer, nullable=True)
+
     is_transfer = Column(Boolean, default=False)
     transfer_pair_id = Column(String, nullable=True)
     recurrence_group = Column(String, nullable=True)
@@ -336,6 +339,7 @@ def ensure_columns_sqlite(engine):
         try_exec(conn, "ALTER TABLE transactions ADD COLUMN recurrence_group TEXT")
         try_exec(conn, "ALTER TABLE transactions ADD COLUMN reference TEXT")
         try_exec(conn, "ALTER TABLE transactions ADD COLUMN notes TEXT")
+        try_exec(conn, "ALTER TABLE transactions ADD COLUMN project_id INTEGER")
 
         try_exec(conn, "ALTER TABLE attachments ADD COLUMN content_type TEXT")
         try_exec(conn, "ALTER TABLE attachments ADD COLUMN uploaded_at DATETIME")
@@ -387,6 +391,7 @@ def ensure_columns_postgres(engine):
         add_if_missing("transactions", "recurrence_group", "text")
         add_if_missing("transactions", "reference", "text")
         add_if_missing("transactions", "notes", "text")
+        add_if_missing("transactions", "project_id", "integer")
 
         add_if_missing("attachments", "content_type", "text")
         add_if_missing("attachments", "uploaded_at", "timestamp")
