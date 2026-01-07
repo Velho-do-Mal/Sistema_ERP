@@ -86,6 +86,53 @@ def apply_theme():
         box-shadow: 0 12px 26px rgba(2,6,23,0.06) !important;
     }
 
+
+
+    /* Inputs (texto) e selects (combo) com fundo branco para melhor legibilidade */
+    /* TextInput / NumberInput / DateInput / TextArea */
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input,
+    div[data-testid="stDateInput"] input,
+    div[data-testid="stTimeInput"] input,
+    div[data-testid="stTextArea"] textarea{
+        background: #FFFFFF !important;
+        color: var(--bk-text) !important;
+        border: 1px solid rgba(15,23,42,0.20) !important;
+        border-radius: 12px !important;
+        box-shadow: none !important;
+    }
+    div[data-testid="stTextInput"] input::placeholder,
+    div[data-testid="stTextArea"] textarea::placeholder{
+        color: rgba(15,23,42,0.55) !important;
+    }
+    div[data-testid="stTextInput"] input:focus,
+    div[data-testid="stNumberInput"] input:focus,
+    div[data-testid="stDateInput"] input:focus,
+    div[data-testid="stTimeInput"] input:focus,
+    div[data-testid="stTextArea"] textarea:focus{
+        outline: none !important;
+        border: 1px solid rgba(11,94,215,0.65) !important;
+        box-shadow: 0 0 0 3px rgba(11,94,215,0.12) !important;
+    }
+
+    /* Selectbox / Multiselect (BaseWeb) */
+    div[data-baseweb="select"] > div{
+        background: #FFFFFF !important;
+        border: 1px solid rgba(15,23,42,0.20) !important;
+        border-radius: 12px !important;
+        box-shadow: none !important;
+    }
+    div[data-baseweb="select"] span{
+        color: var(--bk-text) !important;
+    }
+    div[data-baseweb="select"] svg{
+        color: rgba(15,23,42,0.70) !important;
+    }
+    div[data-baseweb="select"]:focus-within > div{
+        border: 1px solid rgba(11,94,215,0.65) !important;
+        box-shadow: 0 0 0 3px rgba(11,94,215,0.12) !important;
+    }
+
     /* Garantir que tabelas / dataframes mantenham o layout com bordas e padding */
     div[data-testid="stDataFrame"] table,
     div[data-testid="stTable"] table,
