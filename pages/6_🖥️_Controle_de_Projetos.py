@@ -22,9 +22,186 @@ from sqlalchemy import text, inspect
 
 # camada compartilhada
 from bk_erp_shared.erp_db import ensure_erp_tables, get_finance_db
-from bk_erp_shared.auth import login_and_guard
+from bk_erp_shared.auth import login_and_guard, current_user
 
 import bk_finance  # utilitários do financeiro (format, etc.)
+
+# -------------------------
+# Controle de Documentos - Eventos de Status (Lead Time)
+# -------------------------
+def _ensure_doc_events_table(SessionLocal) -> None:
+    ddl_pg = '''
+    CREATE TABLE IF NOT EXISTS doc_status_events (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL,
+        doc_code TEXT NOT NULL,
+        revision TEXT DEFAULT '',
+        status TEXT NOT NULL,
+        responsible TEXT DEFAULT 'BK',
+        note TEXT DEFAULT '',
+        user_email TEXT DEFAULT '',
+        entered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    '''
+    ddl_sqlite = '''
+    CREATE TABLE IF NOT EXISTS doc_status_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        doc_code TEXT NOT NULL,
+        revision TEXT DEFAULT '',
+        status TEXT NOT NULL,
+        responsible TEXT DEFAULT 'BK',
+        note TEXT DEFAULT '',
+        user_email TEXT DEFAULT '',
+        entered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    '''
+    with SessionLocal() as conn:
+        try:
+            conn.execute(text(ddl_pg))
+        except Exception:
+            conn.execute(text(ddl_sqlite))
+
+
+def _insert_doc_event(SessionLocal, project_id: int, doc_code: str, revision: str, status: str,
+                      responsible: str, note: str, user_email: str) -> None:
+    _ensure_doc_events_table(SessionLocal)
+    with SessionLocal() as conn:
+        conn.execute(
+            text(
+                '''
+                INSERT INTO doc_status_events (project_id, doc_code, revision, status, responsible, note, user_email, entered_at)
+                VALUES (:pid, :doc, :rev, :status, :resp, :note, :email, CURRENT_TIMESTAMP)
+                '''
+            ),
+            {
+                "pid": int(project_id),
+                "doc": doc_code.strip(),
+                "rev": (revision or "").strip(),
+                "status": status.strip().lower(),
+                "resp": (responsible or "BK").strip().upper(),
+                "note": (note or "").strip(),
+                "email": (user_email or "").strip(),
+            },
+        )
+
+
+def _load_doc_events(engine, project_id: int) -> pd.DataFrame:
+    sql = '''
+    SELECT id, project_id, doc_code, revision, status, responsible, note, user_email, entered_at
+    FROM doc_status_events
+    WHERE project_id = :pid
+    ORDER BY doc_code, entered_at, id
+    '''
+    df = pd.read_sql(sql, engine, params={"pid": int(project_id)})
+    df["entered_at"] = pd.to_datetime(df["entered_at"], errors="coerce")
+    return df
+
+
+
+def _compute_doc_lead_times(events: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula lead time (em dias corridos) por documento, somando:
+      - por etapa: elaboracao / analise / revisao
+      - por responsável: BK / CLIENTE
+      - por combinação etapa x responsável (ex.: revisao_BK, analise_CLIENTE)
+    """
+    cols = [
+        "doc_code", "ultima_rev", "status_atual",
+        "dias_elaboracao", "dias_analise", "dias_revisao", "dias_total",
+        "dias_BK", "dias_CLIENTE",
+        "dias_elaboracao_BK", "dias_elaboracao_CLIENTE",
+        "dias_analise_BK", "dias_analise_CLIENTE",
+        "dias_revisao_BK", "dias_revisao_CLIENTE",
+    ]
+
+    if events.empty:
+        return pd.DataFrame(columns=cols)
+
+    # normaliza colunas esperadas
+    e = events.copy()
+    e["entered_at"] = pd.to_datetime(e["entered_at"], errors="coerce")
+    e = e.sort_values(["doc_code", "entered_at", "id"], ascending=[True, True, True])
+
+    etapas = ["elaboracao", "analise", "revisao"]
+    responsaveis = ["BK", "CLIENTE"]
+
+    out_rows = []
+    for doc_code, g in e.groupby("doc_code", sort=True):
+        g = g.reset_index(drop=True)
+
+        dias_por_etapa = {k: 0.0 for k in etapas}
+        dias_por_resp = {k: 0.0 for k in responsaveis}
+        dias_combo = {(et, rp): 0.0 for et in etapas for rp in responsaveis}
+
+        for i in range(len(g)):
+            cur = g.iloc[i]
+            nxt = g.iloc[i + 1] if i + 1 < len(g) else None
+
+            t0 = cur.get("entered_at")
+            if pd.isna(t0):
+                continue
+
+            # fim do intervalo: próximo evento ou agora
+            t1 = nxt.get("entered_at") if nxt is not None else pd.Timestamp.now(tz=None)
+            if pd.isna(t1):
+                t1 = pd.Timestamp.now(tz=None)
+            if t1 < t0:
+                continue
+
+            delta_days = (t1 - t0).total_seconds() / 86400.0
+
+            stt = str(cur.get("status") or "").strip().lower()
+            # normaliza sinônimos comuns
+            if stt in ("elaboração", "elaboracao", "elaboração interna"):
+                stt = "elaboracao"
+            elif stt in ("análise", "analise", "análise cliente", "analise cliente"):
+                stt = "analise"
+            elif stt in ("revisão", "revisao", "revisão interna"):
+                stt = "revisao"
+
+            resp = str(cur.get("responsible") or "").strip().upper()
+            if resp not in responsaveis:
+                resp = "BK"
+
+            if stt in dias_por_etapa:
+                dias_por_etapa[stt] += delta_days
+                dias_combo[(stt, resp)] += delta_days
+
+            if resp in dias_por_resp:
+                dias_por_resp[resp] += delta_days
+
+        last = g.iloc[-1]
+        status_atual = str(last.get("status") or "").strip().lower()
+        ultima_rev = str(last.get("revision") or "")
+
+        dias_total = sum(dias_por_etapa.values())
+
+        out_rows.append({
+            "doc_code": doc_code,
+            "ultima_rev": ultima_rev,
+            "status_atual": status_atual,
+            "dias_elaboracao": round(dias_por_etapa["elaboracao"], 2),
+            "dias_analise": round(dias_por_etapa["analise"], 2),
+            "dias_revisao": round(dias_por_etapa["revisao"], 2),
+            "dias_total": round(dias_total, 2),
+            "dias_BK": round(dias_por_resp["BK"], 2),
+            "dias_CLIENTE": round(dias_por_resp["CLIENTE"], 2),
+
+            "dias_elaboracao_BK": round(dias_combo[("elaboracao", "BK")], 2),
+            "dias_elaboracao_CLIENTE": round(dias_combo[("elaboracao", "CLIENTE")], 2),
+
+            "dias_analise_BK": round(dias_combo[("analise", "BK")], 2),
+            "dias_analise_CLIENTE": round(dias_combo[("analise", "CLIENTE")], 2),
+
+            "dias_revisao_BK": round(dias_combo[("revisao", "BK")], 2),
+            "dias_revisao_CLIENTE": round(dias_combo[("revisao", "CLIENTE")], 2),
+        })
+
+    df = pd.DataFrame(out_rows, columns=cols)
+    # documentos mais demorados primeiro
+    return df.sort_values(["dias_total", "doc_code"], ascending=[False, True])
+
 
 
 # -------------------------
@@ -238,10 +415,20 @@ def _get_renderer(engine, SessionLocal):
             except Exception:
                 tasks_overdue = tasks_df.iloc[0:0]
 
+            # documentos (lead time) - resumo para o relatório
+            docs_summary = pd.DataFrame()
+            if project_id is not None:
+                try:
+                    ev = _load_doc_events(engine, int(project_id))
+                    if not ev.empty:
+                        docs_summary = _compute_doc_lead_times(ev)
+                except Exception:
+                    docs_summary = pd.DataFrame()
+
             tpl_path = Path("reports/templates/controle_projetos_BK.html")
             template_html = tpl_path.read_text(encoding="utf-8") if tpl_path.exists() else "<html><body>{{content}}</body></html>"
 
-            html = rc_build_report(template_html, projects, tasks_df, projects_overdue, tasks_overdue)
+            html = rc_build_report(template_html, projects, tasks_df, projects_overdue, tasks_overdue, docs_summary=docs_summary)
             return html
 
         return _wrapper
@@ -290,16 +477,39 @@ def main():
         progress = st.slider("Progresso (%)", 0, 100, int(row.get("progress_pct") or 0))
 
         planned_default = row.get("planned_end_date")
-        if pd.isna(planned_default) or planned_default is None or planned_default == "":
-            planned_default = date.today()
         actual_default = row.get("actual_end_date")
-        if pd.isna(actual_default) or actual_default is None or actual_default == "":
-            actual_default = planned_default
+
+        def _coerce_date(v, fallback: date) -> date:
+            """Converte valores diversos (date/datetime/Timestamp/str/NaT) para date."""
+            try:
+                if v is None:
+                    return fallback
+                if isinstance(v, date):
+                    return v
+                # pandas Timestamp / datetime
+                if hasattr(v, "to_pydatetime"):
+                    return v.to_pydatetime().date()
+                s = str(v).strip()
+                if s == "" or s.lower() in ("none", "nat", "nan"):
+                    return fallback
+                parsed = pd.to_datetime(s, errors="coerce")
+                if pd.isna(parsed):
+                    return fallback
+                return parsed.date()
+            except Exception:
+                return fallback
+
+        planned_default = _coerce_date(planned_default, date.today())
+        actual_default = _coerce_date(actual_default, planned_default)
 
         planned = st.date_input("Entrega prevista", value=planned_default)
         actual = st.date_input("Entrega real (se concluído)", value=actual_default)
 
-        resp = st.selectbox("Responsável pelo atraso", ["N/A", "CLIENTE", "BK"], index=["N/A", "CLIENTE", "BK"].index(str(row.get("delay_responsibility") or "N/A")))
+        _opts_resp = ["N/A", "CLIENTE", "BK"]
+        _cur_resp = str(row.get("delay_responsibility") or "N/A").upper()
+        if _cur_resp not in _opts_resp:
+            _cur_resp = "N/A"
+        resp = st.selectbox("Responsável pelo atraso", _opts_resp, index=_opts_resp.index(_cur_resp))
 
         if st.button("Salvar projeto", type="primary", use_container_width=True):
             update_project(SessionLocal, pid, status, progress, planned, actual, resp)
@@ -344,6 +554,97 @@ def main():
                     mark_done(SessionLocal, opt[tsel])
                     st.success("Concluída.")
                     st.rerun()
+        st.divider()
+        st.subheader("📄 Controle de documentos (lead time)")
+
+        st.caption("Registre cada mudança de status do documento. O sistema soma o tempo (dias corridos) em cada etapa até a próxima movimentação.")
+        colA, colB, colC = st.columns([1.2, 0.8, 1.0])
+        with colA:
+            doc_code = st.text_input("Documento (código)", value="", key="doc_evt_code")
+            revision = st.text_input("Revisão", value="", key="doc_evt_rev", placeholder="Ex.: R00, R01...")
+        with colB:
+            status_doc = st.selectbox("Status", ["elaboracao", "analise", "revisao", "aprovado"], index=0, key="doc_evt_status")
+            # Sugestão automática: análise geralmente fica com o CLIENTE; revisão/elaboração com a BK.
+            prev_status = st.session_state.get("_doc_evt_prev_status")
+            if prev_status != status_doc:
+                st.session_state["_doc_evt_prev_status"] = status_doc
+                st.session_state["doc_evt_resp"] = "CLIENTE" if status_doc == "analise" else "BK"
+
+            _resp_opts = ["BK", "CLIENTE"]
+            _cur_resp = st.session_state.get("doc_evt_resp", "BK")
+            if _cur_resp not in _resp_opts:
+                _cur_resp = "BK"
+            responsible = st.selectbox("Responsável pela etapa", _resp_opts, index=_resp_opts.index(_cur_resp), key="doc_evt_resp")
+        with colC:
+            note = st.text_input("Observação (opcional)", value="", key="doc_evt_note")
+
+        if st.button("Registrar movimentação", type="primary", use_container_width=True, key="doc_evt_add"):
+            if not doc_code.strip():
+                st.warning("Informe o código do documento.")
+            else:
+                try:
+                    _insert_doc_event(SessionLocal, pid, doc_code, revision, status_doc, responsible, note, current_user().get("email"))
+                    st.success("Movimentação registrada.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao registrar: {e}")
+
+        events = _load_doc_events(engine, pid)
+        if events.empty:
+            st.info("Nenhuma movimentação registrada para este projeto.")
+        else:
+            st.markdown("##### Resumo (dias por etapa e responsável)")
+            summary = _compute_doc_lead_times(events)
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+
+            # --- Gráficos (lead time por etapa x responsável)
+            try:
+                import plotly.express as px
+
+                st.markdown("##### Gráficos (tempo por etapa x responsável)")
+
+                total_analise_cliente = float(summary.get("dias_analise_CLIENTE", pd.Series(dtype=float)).sum())
+                total_revisao_bk = float(summary.get("dias_revisao_BK", pd.Series(dtype=float)).sum())
+                total_elab_bk = float(summary.get("dias_elaboracao_BK", pd.Series(dtype=float)).sum())
+                total = float(summary.get("dias_total", pd.Series(dtype=float)).sum())
+
+                outros = max(0.0, total - (total_analise_cliente + total_revisao_bk + total_elab_bk))
+
+                agg = pd.DataFrame([
+                    {"Etapa": "Elaboração (BK)", "Dias": total_elab_bk},
+                    {"Etapa": "Análise (Cliente)", "Dias": total_analise_cliente},
+                    {"Etapa": "Revisão (BK)", "Dias": total_revisao_bk},
+                    {"Etapa": "Outros", "Dias": outros},
+                ])
+
+                fig_total = px.bar(agg, x="Etapa", y="Dias", text_auto=True, title="Tempo total (dias corridos)")
+                st.plotly_chart(fig_total, use_container_width=True)
+
+                c1, c2 = st.columns(2, gap="large")
+                with c1:
+                    top_a = summary.sort_values("dias_analise_CLIENTE", ascending=False).head(10)
+                    fig_a = px.bar(top_a, x="doc_code", y="dias_analise_CLIENTE", text_auto=True,
+                                   title="Top 10 documentos - Análise com Cliente (dias)")
+                    st.plotly_chart(fig_a, use_container_width=True)
+                with c2:
+                    top_r = summary.sort_values("dias_revisao_BK", ascending=False).head(10)
+                    fig_r = px.bar(top_r, x="doc_code", y="dias_revisao_BK", text_auto=True,
+                                   title="Top 10 documentos - Revisão com BK (dias)")
+                    st.plotly_chart(fig_r, use_container_width=True)
+
+            except Exception as _e:
+                st.info("Não foi possível gerar gráficos automaticamente para este relatório (dependência de Plotly).")
+
+
+            with st.expander("Ver eventos (linha do tempo)", expanded=False):
+                events_disp = events.copy()
+                events_disp["entered_at"] = events_disp["entered_at"].dt.strftime("%d/%m/%Y %H:%M")
+                st.dataframe(events_disp[["doc_code","revision","status","responsible","entered_at","user_email","note"]], use_container_width=True, hide_index=True)
+
+            # download CSV do resumo
+            csv = summary.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Baixar resumo (CSV)", data=csv, file_name=f"lead_time_documentos_projeto_{pid}.csv", mime="text/csv", use_container_width=True)
+
 
 
 if __name__ == "__main__":

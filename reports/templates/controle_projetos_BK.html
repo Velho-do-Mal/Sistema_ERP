@@ -64,6 +64,35 @@
       </div>
     </div>
 
+
+    <div class="section">
+      <h2>Documentos (tempo de análise / revisão)</h2>
+      <div class="muted">Foco: Revisões com a BK e análises com o cliente (dias corridos)</div>
+      <div class="charts">
+        <div class="imgbox">
+          <div class="muted">Tempo total por etapa x responsável</div>
+          {{chart_docs_leadtime_svg}}
+        </div>
+      </div>
+
+      <h3>Top documentos (gargalos)</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Documento</th>
+            <th>Últ. Rev</th>
+            <th>Status atual</th>
+            <th>Análise (Cliente)</th>
+            <th>Revisão (BK)</th>
+            <th>Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{docs_rows}}
+        </tbody>
+      </table>
+    </div>
+
     <div class="section">
       <h2>Projetos (com atraso)</h2>
       <table>

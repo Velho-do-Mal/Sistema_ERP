@@ -81,6 +81,55 @@ def render_html(template_html: str, context: Dict[str, Any]) -> str:
     return out
 
 
+def chart_docs_leadtime(docs_summary: pd.DataFrame) -> str:
+    """Gráfico (dias) destacando Análise com Cliente e Revisão com BK."""
+    if docs_summary is None or docs_summary.empty:
+        fig = plt.figure()
+        plt.text(0.5, 0.5, "Sem dados de documentos", ha="center", va="center")
+        plt.axis("off")
+        return _fig_to_b64(fig)
+
+    total_analise_cliente = float(docs_summary.get("dias_analise_CLIENTE", pd.Series(dtype=float)).sum())
+    total_revisao_bk = float(docs_summary.get("dias_revisao_BK", pd.Series(dtype=float)).sum())
+    total_elab_bk = float(docs_summary.get("dias_elaboracao_BK", pd.Series(dtype=float)).sum())
+    total = float(docs_summary.get("dias_total", pd.Series(dtype=float)).sum())
+    outros = max(0.0, total - (total_analise_cliente + total_revisao_bk + total_elab_bk))
+
+    labels = ["Elaboração (BK)", "Análise (Cliente)", "Revisão (BK)", "Outros"]
+    values = [total_elab_bk, total_analise_cliente, total_revisao_bk, outros]
+
+    fig = plt.figure()
+    plt.bar(labels, values, color="#0f172a")
+    plt.xticks(rotation=25, ha="right")
+    plt.ylabel("Dias")
+    plt.title("Tempo total por etapa x responsável (dias corridos)")
+    return _fig_to_b64(fig)
+
+
+def make_rows_docs(docs_summary: pd.DataFrame, top_n: int = 12) -> str:
+    """Linhas HTML da tabela de documentos (gargalos)."""
+    if docs_summary is None or docs_summary.empty:
+        return '<tr><td colspan="6" class="muted">Sem dados de documentos.</td></tr>'
+
+    df = docs_summary.copy()
+    # ranking por gargalo (análise cliente + revisão BK)
+    df["_score"] = df.get("dias_analise_CLIENTE", 0).fillna(0) + df.get("dias_revisao_BK", 0).fillna(0)
+    df = df.sort_values("_score", ascending=False).head(top_n)
+
+    rows = []
+    for _, r in df.iterrows():
+        rows.append(
+            "<tr>"
+            f"<td>{r.get('doc_code','')}</td>"
+            f"<td>{r.get('ultima_rev','')}</td>"
+            f"<td>{(r.get('status_atual','') or '').upper()}</td>"
+            f"<td>{r.get('dias_analise_CLIENTE','')}</td>"
+            f"<td>{r.get('dias_revisao_BK','')}</td>"
+            f"<td>{r.get('dias_total','')}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
 def make_rows_projects(projects_overdue: pd.DataFrame) -> str:
     """Cria linhas HTML para projetos em atraso (tabela)."""
     def badge(x: str) -> str:
@@ -126,7 +175,7 @@ def make_rows_tasks(tasks_overdue: pd.DataFrame, project_name_by_id: Dict[int, s
     return "\n".join(rows) if rows else '<tr><td colspan="7" class="muted">Sem tarefas vencidas.</td></tr>'
 
 
-def build_report(template_html: str, projects: pd.DataFrame, tasks: pd.DataFrame, projects_overdue: pd.DataFrame, tasks_overdue: pd.DataFrame) -> str:
+def build_report(template_html: str, projects: pd.DataFrame, tasks: pd.DataFrame, projects_overdue: pd.DataFrame, tasks_overdue: pd.DataFrame, docs_summary: pd.DataFrame | None = None) -> str:
     """
     Gera o HTML final do relatório.
     - template_html: conteúdo do arquivo HTML com placeholders
@@ -134,6 +183,9 @@ def build_report(template_html: str, projects: pd.DataFrame, tasks: pd.DataFrame
     """
     status_b64 = chart_projects_status(projects)
     overdue_b64 = chart_tasks_overdue(tasks)
+    docs_b64 = chart_docs_leadtime(docs_summary if docs_summary is not None else pd.DataFrame())
+    docs_rows = make_rows_docs(docs_summary if docs_summary is not None else pd.DataFrame())
+
 
     # mapa id -> nome do projeto (usado nas tarefas)
     proj_map = {int(r["id"]): str(r.get("nome") or "") for _, r in projects.iterrows() if str(r.get("id","")).isdigit()}
@@ -159,6 +211,8 @@ def build_report(template_html: str, projects: pd.DataFrame, tasks: pd.DataFrame
         # converte charts base64 para tags <img> usadas pelo template
         "chart_projects_status_svg": f'<img src="data:image/png;base64,{status_b64}" alt="Projetos por status" />',
         "chart_tasks_overdue_svg": f'<img src="data:image/png;base64,{overdue_b64}" alt="Tarefas vencidas" />',
+        "chart_docs_leadtime_svg": f'<img src="data:image/png;base64,{docs_b64}" alt="Documentos - lead time" />',
+        "docs_rows": docs_rows,
         "projects_rows": make_rows_projects(projects_overdue),
         "tasks_rows": make_rows_tasks(tasks_overdue, proj_map),
         # footer / logo

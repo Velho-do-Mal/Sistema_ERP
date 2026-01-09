@@ -358,6 +358,182 @@ def calcular_cpm(tasks):
     return tasks, projeto_fim
 
 
+
+def _parse_iso_date(s: str):
+    try:
+        if not s:
+            return None
+        return datetime.fromisoformat(str(s)).date()
+    except Exception:
+        try:
+            return pd.to_datetime(str(s), errors="coerce").date()
+        except Exception:
+            return None
+
+
+def calcular_eap_pmbok(eap_tasks, data_inicio_str: str):
+    """Calcula início/fim (dias corridos) considerando predecessoras e hierarquia (PMBOK/WBS).
+
+    Regras:
+    - Atividades folha: início depende das predecessoras e fim = início + duração (dias corridos).
+    - Relações: FS/SS/FF/SF (simplificado).
+    - Atividades com subníveis viram 'sumário': início = min(inícios dos filhos), fim = max(fins dos filhos),
+      duração = (fim - início) em dias.
+    """
+    if not eap_tasks:
+        return []
+
+    start_date = _parse_iso_date(data_inicio_str) or date.today()
+
+    tasks = [dict(t) for t in eap_tasks]
+    by_code = {str(t.get("codigo") or "").strip(): t for t in tasks if str(t.get("codigo") or "").strip()}
+    codes = list(by_code.keys())
+
+    # detectar hierarquia por prefixo "1.2" -> pai "1"
+    children = {c: [] for c in codes}
+    parents = set()
+    for c in codes:
+        prefix = c + "."
+        for other in codes:
+            if other.startswith(prefix):
+                children[c].append(other)
+                parents.add(c)
+
+    # folhas
+    leaf_codes = [c for c in codes if c not in parents]
+
+    # map pai -> folhas descendentes
+    leaf_by_parent = {}
+    for p in parents:
+        pref = p + "."
+        leaf_by_parent[p] = [lc for lc in leaf_codes if lc.startswith(pref)]
+
+    def _expand_preds(pred_list):
+        out = []
+        for p in pred_list or []:
+            p = str(p).strip()
+            if not p:
+                continue
+            if p in leaf_by_parent:
+                out.extend(leaf_by_parent[p])
+            else:
+                out.append(p)
+        # unique mantendo ordem
+        seen=set()
+        uniq=[]
+        for x in out:
+            if x not in seen:
+                uniq.append(x); seen.add(x)
+        return uniq
+
+    # preparar folhas para cálculo
+    leaf = {c: by_code[c] for c in leaf_codes}
+    for c,t in leaf.items():
+        t["_preds"] = _expand_preds(t.get("predecessoras") or [])
+        t["_rel"] = (t.get("relacao") or "FS").upper()
+        t["_dur"] = int(t.get("duracao") or 0) or 0
+        t["_es"] = None
+        t["_ef"] = None
+
+    # forward pass iterativo (sem considerar calendário útil; dias corridos)
+    for _ in range(2000):
+        changed = False
+        for c,t in leaf.items():
+            if t["_ef"] is not None:
+                continue
+            preds = t["_preds"]
+            rel = t["_rel"]
+            dur = t["_dur"]
+            if not preds:
+                t["_es"] = 0
+                t["_ef"] = 0 + dur
+                changed = True
+                continue
+            ok=True
+            # calcula es conforme relação
+            starts=[]
+            finishes=[]
+            for pc in preds:
+                pt = leaf.get(pc)
+                # se predecessor não for folha, ignora (evita quebrar)
+                if not pt or pt["_ef"] is None or pt["_es"] is None:
+                    ok=False
+                    break
+                starts.append(pt["_es"])
+                finishes.append(pt["_ef"])
+            if not ok:
+                continue
+
+            if rel == "FS":
+                es = max(finishes)
+            elif rel == "SS":
+                es = max(starts)
+            elif rel == "FF":
+                es = max(finishes) - dur
+            elif rel == "SF":
+                es = max(starts) - dur
+            else:
+                es = max(finishes)
+
+            if es < 0:
+                es = 0
+            t["_es"] = es
+            t["_ef"] = es + dur
+            changed = True
+        if not changed:
+            break
+
+    # converter folhas para datas
+    for c,t in leaf.items():
+        es = int(t.get("_es") or 0)
+        ef = int(t.get("_ef") or 0)
+        t["data_inicio_calc"] = (start_date + timedelta(days=es)).isoformat()
+        t["data_fim_calc"] = (start_date + timedelta(days=ef)).isoformat()
+
+    # rollup para tarefas sumário (pais), do nível mais profundo para cima
+    def _desc_leaves(pcode):
+        return leaf_by_parent.get(pcode) or []
+
+    # ordena pais por profundidade (mais profundo primeiro)
+    parent_codes = sorted(list(parents), key=lambda x: x.count("."), reverse=True)
+    for pc in parent_codes:
+        desc = _desc_leaves(pc)
+        if not desc:
+            continue
+        starts = []
+        ends = []
+        for lc in desc:
+            lt = leaf.get(lc)
+            if not lt:
+                continue
+            s = _parse_iso_date(lt.get("data_inicio_calc") or "")
+            e = _parse_iso_date(lt.get("data_fim_calc") or "")
+            if s: starts.append(s)
+            if e: ends.append(e)
+        if not starts or not ends:
+            continue
+        smin = min(starts)
+        emax = max(ends)
+        pt = by_code.get(pc)
+        if pt is None:
+            continue
+        pt["data_inicio_calc"] = smin.isoformat()
+        pt["data_fim_calc"] = emax.isoformat()
+        pt["duracao_calc"] = (emax - smin).days  # dias corridos (fim = início + duração)
+
+    # para folhas, duracao_calc = duracao original
+    for c,t in leaf.items():
+        t["duracao_calc"] = int(t.get("_dur") or 0)
+
+    # retorna lista no mesmo formato do eap_tasks, com campos extras
+    out=[]
+    for c in sorted(codes):
+        t = by_code[c]
+        out.append(t)
+    return out
+
+
+
 def gerar_curva_s_trabalho(tasks, data_inicio_str):
     if not tasks or not data_inicio_str:
         return None
@@ -1072,11 +1248,63 @@ with tabs[2]:
             niv = int(row.get("nivel", 1)) if row.get("nivel") else 1
             return ("\u00A0" * 4 * (niv - 1)) + str(row.get("descricao", ""))
         df_eap_display["descricao"] = df_eap_display.apply(indent_desc, axis=1)
+
+        # Calcula cronograma (PMBOK) usando data de início do projeto (TAP)
+        data_inicio_proj = (tap.get("dataInicio") or "").strip()
+        eap_calc = calcular_eap_pmbok(eapTasks, data_inicio_proj)
+        df_calc = pd.DataFrame(eap_calc)
+
+        # adiciona colunas calculadas (início/fim/duração)
+        if not df_calc.empty:
+            df_eap_display = df_eap_display.merge(
+                df_calc[["id", "data_inicio_calc", "data_fim_calc", "duracao_calc"]],
+                on="id",
+                how="left",
+            )
+            # formata para exibição
+            def _fmt_d(x):
+                try:
+                    d = pd.to_datetime(x, errors="coerce")
+                    return "" if pd.isna(d) else d.strftime("%d/%m/%Y")
+                except Exception:
+                    return str(x or "")
+            df_eap_display["inicio"] = df_eap_display["data_inicio_calc"].apply(_fmt_d)
+            df_eap_display["fim"] = df_eap_display["data_fim_calc"].apply(_fmt_d)
+            df_eap_display["duracao_pmbok"] = df_eap_display["duracao_calc"]
+        else:
+            df_eap_display["inicio"] = ""
+            df_eap_display["fim"] = ""
+            df_eap_display["duracao_pmbok"] = df_eap_display.get("duracao")
+
+
         # Exibe a tabela com a descrição indentada
         try:
-            st.dataframe(df_eap_display.drop(columns=["id"]), use_container_width=True, height=260)
+            cols_show = [c for c in ["codigo","nivel","descricao","responsavel","predecessoras","relacao","duracao","duracao_pmbok","inicio","fim","status"] if c in df_eap_display.columns]
+            st.dataframe(df_eap_display[cols_show], use_container_width=True, height=320)
         except Exception:
             st.dataframe(df_eap_display, use_container_width=True, height=260)
+
+
+        st.markdown("#### 📄 Relatório EAP (Status)")
+        st.caption("Exporta apenas a EAP com início/fim (PMBOK) e status de cada atividade.")
+        df_rep = df_eap_display.copy()
+        rep_cols = [c for c in ["codigo","descricao","nivel","inicio","fim","duracao_pmbok","status"] if c in df_rep.columns]
+        df_rep = df_rep[rep_cols].rename(columns={"duracao_pmbok":"duracao_dias"})
+        st.dataframe(df_rep, use_container_width=True, hide_index=True, height=260)
+
+        # downloads
+        csv_bytes = df_rep.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Baixar CSV", data=csv_bytes, file_name="relatorio_eap_status.csv", mime="text/csv")
+
+        try:
+            import io
+            bio = io.BytesIO()
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                df_rep.to_excel(writer, index=False, sheet_name="EAP_Status")
+            st.download_button("⬇️ Baixar Excel", data=bio.getvalue(), file_name="relatorio_eap_status.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception:
+            st.caption("Excel indisponível (dependência openpyxl). Use CSV.")
+
 
         idx_eap = st.selectbox(
             "Selecione a atividade para editar / excluir",
