@@ -333,6 +333,12 @@ def _to_date(val):
                 return None
     return None
 
+
+def _parse_date(val):
+    """Alias compatível: usa _to_date para converter qualquer datelike em date."""
+    return _to_date(val)
+
+
 def _iso(d):
     return d.strftime("%Y-%m-%d") if isinstance(d, date) else ""
 
@@ -1292,10 +1298,160 @@ with tabs[2]:
             return ("\u00A0" * 4 * (niv - 1)) + str(row.get("descricao", ""))
         df_eap_display["descricao"] = df_eap_display.apply(indent_desc, axis=1)
         # Exibe a tabela com a descrição indentada
+        st.caption("Edite direto na tabela (estilo Excel). Observação: se a atividade tiver predecessora, o início planejado é recalculado automaticamente conforme a relação (FS/SS/FF/SF) ao salvar.")
+
+        # Tabela editável (PowerApps/Excel) — tenta AgGrid; se não existir, usa st.data_editor
+        df_edit = df_eap_sorted[[
+            "id","codigo","nivel","descricao","duracao","responsavel","predecessoras","relacao","status",
+            "inicio_planejado","inicio_real","fim_real","inicio_previsto","fim_previsto"
+        ]].copy()
+        df_edit["predecessoras"] = df_edit["predecessoras"].apply(
+            lambda v: ", ".join(v) if isinstance(v, list) else (str(v) if v not in (None, "") else "")
+        )
+        df_edit["inicio_planejado"] = df_edit["inicio_planejado"].apply(lambda v: _iso(_to_date(v)) if v else "")
+        df_edit["inicio_real"] = df_edit["inicio_real"].apply(lambda v: _iso(_to_date(v)) if v else "")
+        df_edit["fim_real"] = df_edit["fim_real"].apply(lambda v: _iso(_to_date(v)) if v else "")
+        df_edit["Excluir"] = False
+
+        use_aggrid = False
         try:
-            st.dataframe(df_eap_display.drop(columns=["id"]), use_container_width=True, height=260)
+            from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+            use_aggrid = True
         except Exception:
-            st.dataframe(df_eap_display, use_container_width=True, height=260)
+            use_aggrid = False
+
+        edited_df = None
+        selected_rows = []
+        if use_aggrid:
+            gb = GridOptionsBuilder.from_dataframe(df_edit)
+            gb.configure_default_column(editable=True, resizable=True, filter=True)
+            gb.configure_selection("multiple", use_checkbox=True)
+            gb.configure_column("id", header_name="ID", editable=False, width=80)
+            gb.configure_column("codigo", header_name="Código", width=110)
+            gb.configure_column("nivel", header_name="Nível", width=90)
+            gb.configure_column("duracao", header_name="Duração (dias)", width=140)
+            gb.configure_column("inicio_previsto", header_name="Início (calc)", editable=False, width=140)
+            gb.configure_column("fim_previsto", header_name="Fim (calc)", editable=False, width=140)
+            gb.configure_column("Excluir", header_name="Excluir", editable=True, width=90)
+            grid = AgGrid(
+                df_edit,
+                gridOptions=gb.build(),
+                update_mode=GridUpdateMode.MODEL_CHANGED,
+                data_return_mode=DataReturnMode.AS_INPUT,
+                fit_columns_on_grid_load=True,
+                height=320,
+                key="eap_grid",
+            )
+            edited_df = pd.DataFrame(grid["data"])
+            selected_rows = grid.get("selected_rows") or []
+        else:
+            col_cfg = {
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "codigo": st.column_config.TextColumn("Código", required=True),
+                "nivel": st.column_config.SelectboxColumn("Nível", options=[1,2,3,4], required=True),
+                "descricao": st.column_config.TextColumn("Descrição", required=True),
+                "duracao": st.column_config.NumberColumn("Duração (dias corridos)", min_value=0, step=1, required=True),
+                "responsavel": st.column_config.TextColumn("Responsável"),
+                "predecessoras": st.column_config.TextColumn("Predecessoras (códigos, vírgula)"),
+                "relacao": st.column_config.SelectboxColumn("Relação", options=["FS","SS","FF","SF"], required=True),
+                "status": st.column_config.SelectboxColumn(
+                    "Status", options=["nao-iniciado","em-andamento","em-analise","em-revisao","concluido"], required=True
+                ),
+                "inicio_planejado": st.column_config.TextColumn("Início planejado (YYYY-MM-DD)"),
+                "inicio_real": st.column_config.TextColumn("Início real (YYYY-MM-DD)"),
+                "fim_real": st.column_config.TextColumn("Fim real (YYYY-MM-DD)"),
+                "inicio_previsto": st.column_config.TextColumn("Início (calc)", disabled=True),
+                "fim_previsto": st.column_config.TextColumn("Fim (calc)", disabled=True),
+                "Excluir": st.column_config.CheckboxColumn("Excluir", default=False),
+            }
+            edited_df = st.data_editor(
+                df_edit.drop(columns=["descricao"]).assign(descricao=df_edit["descricao"]),  # garante ordem
+                column_config=col_cfg,
+                disabled=["inicio_previsto","fim_previsto"],
+                num_rows="dynamic",
+                use_container_width=True,
+                hide_index=True,
+                key="eap_editor_table",
+            )
+
+        # Botão de exclusão rápida (selecionados no AgGrid)
+        if selected_rows and st.button("🗑️ Excluir selecionados", type="secondary", use_container_width=True):
+            sel_ids = {int(r["id"]) for r in selected_rows if r.get("id") is not None}
+            before = len(eapTasks)
+            eapTasks[:] = [t for t in eapTasks if int(t.get("id")) not in sel_ids]
+            salvar_estado()
+            st.success(f"Excluídas {before - len(eapTasks)} atividades.")
+            st.rerun()
+
+        if st.button("💾 Salvar alterações da EAP", type="primary", use_container_width=True):
+            df_upd = pd.DataFrame(edited_df)
+            if df_upd.empty:
+                st.warning("Tabela vazia.")
+            else:
+                # Aplica exclusões (checkbox)
+                del_ids = set(df_upd.loc[df_upd["Excluir"] == True, "id"].dropna().astype(int).tolist()) if "Excluir" in df_upd.columns else set()
+                if del_ids:
+                    eapTasks[:] = [t for t in eapTasks if int(t.get("id")) not in del_ids]
+
+                # Atualiza / insere
+                by_id = {int(t.get("id")): t for t in eapTasks if t.get("id") is not None}
+                for _, r in df_upd.iterrows():
+                    rid = r.get("id")
+                    if rid is None or (isinstance(rid, float) and pd.isna(rid)):
+                        # nova linha
+                        rid = int(datetime.now().timestamp() * 1000)
+                        task = {"id": rid}
+                        eapTasks.append(task)
+                        by_id[int(rid)] = task
+                    else:
+                        rid = int(rid)
+                        task = by_id.get(rid)
+                        if task is None:
+                            task = {"id": rid}
+                            eapTasks.append(task)
+                            by_id[rid] = task
+
+                    if bool(r.get("Excluir", False)):
+                        continue
+
+                    task["codigo"] = str(r.get("codigo", "") or "").strip()
+                    task["nivel"] = int(r.get("nivel") or 1)
+                    task["descricao"] = str(r.get("descricao", "") or "").strip()
+                    task["duracao"] = int(r.get("duracao") or 0)
+                    task["responsavel"] = str(r.get("responsavel", "") or "").strip()
+                    preds_str = str(r.get("predecessoras", "") or "")
+                    task["predecessoras"] = [x.strip() for x in preds_str.split(",") if x.strip()]
+                    rel = str(r.get("relacao", "FS") or "FS").strip().upper()
+                    task["relacao"] = rel if rel in {"FS","SS","FF","SF"} else "FS"
+                    stt = str(r.get("status", "nao-iniciado") or "nao-iniciado").strip()
+                    task["status"] = stt
+
+                    # datas (strings)
+                    task["inicio_planejado"] = str(r.get("inicio_planejado", "") or "").strip()
+                    task["inicio_real"] = str(r.get("inicio_real", "") or "").strip()
+                    task["fim_real"] = str(r.get("fim_real", "") or "").strip()
+
+                # Recalcula cronograma (MS Project básico) e persiste início planejado calculado + duração sumária
+                tasks_sched, _ps, _pf = schedule_eap(eapTasks, project_start=tap.get("dataInicio"))
+                parent_by_id, children_by_id, task_by_id, ordered = _build_hierarchy(eapTasks)
+                sched_by_id = {int(t["id"]): t for t in tasks_sched if t.get("id") is not None}
+
+                for t in eapTasks:
+                    tid = int(t.get("id"))
+                    s = sched_by_id.get(tid)
+                    if s and s.get("_ps"):
+                        t["inicio_planejado"] = _iso(s.get("_ps"))
+
+                # atualiza duração das sumárias pelo intervalo calculado
+                for pid, childs in children_by_id.items():
+                    if childs:
+                        s = sched_by_id.get(int(pid))
+                        if s and s.get("_ps") and s.get("_pf"):
+                            task_by_id[int(pid)]["duracao"] = int((s["_pf"] - s["_ps"]).days)
+
+                salvar_estado()
+                st.success("EAP atualizada e cronograma recalculado.")
+                st.rerun()
 
         with st.expander("📄 Relatório EAP (Status)", expanded=False):
             cols = ["codigo", "descricao", "nivel", "inicio_previsto", "fim_previsto", "duracao", "status", "responsavel"]
@@ -1472,6 +1628,58 @@ with tabs[2]:
                 st.plotly_chart(fig_gantt, use_container_width=True, key="gantt_main")
             else:
                 st.caption("Gantt indisponível - verifique dados da EAP e data de início.")
+            # ---- Indicadores rápidos (Prazo e Custo) ----
+            try:
+                tasks_sched, proj_start_dt, proj_end_dt = schedule_eap(eapTasks, project_start=tap.get("dataInicio"))
+                if proj_end_dt:
+                    today = date.today()
+                    # conclusão real (se existir)
+                    real_ends = [_to_date(t.get("fim_real")) for t in eapTasks if _to_date(t.get("fim_real"))]
+                    actual_end_dt = max(real_ends) if real_ends else None
+
+                    # considera "concluído" quando todas as atividades folha estão concluídas
+                    parent_by_id, children_by_id, task_by_id, ordered = _build_hierarchy(eapTasks)
+                    summary_ids = set(children_by_id.keys())
+                    leaf_tasks = [t for t in ordered if int(t.get("id")) not in summary_ids]
+                    done_leaf = [t for t in leaf_tasks if str(t.get("status")) == "concluido" or _to_date(t.get("fim_real"))]
+                    all_done = (len(leaf_tasks) > 0 and len(done_leaf) == len(leaf_tasks))
+
+                    ref_end = actual_end_dt if all_done and actual_end_dt else today
+                    atraso_dias = (ref_end - proj_end_dt).days
+                    situacao = "No prazo" if atraso_dias <= 0 else "Atrasado"
+                    cA, cB, cC = st.columns(3)
+                    with cA:
+                        st.metric("Término planejado", proj_end_dt.strftime("%Y-%m-%d"))
+                    with cB:
+                        st.metric("Término real/atual", ref_end.strftime("%Y-%m-%d"))
+                    with cC:
+                        st.metric("Situação (prazo)", situacao, delta=f"{atraso_dias} dias")
+
+                # custo (planejado x realizado) com base nos lançamentos financeiros
+                despesas_prev = 0.0
+                despesas_real = 0.0
+                for l in finances or []:
+                    try:
+                        tipo = str(l.get("tipo") or "").lower()
+                        valor = float(l.get("valor") or 0)
+                        if "desp" in tipo or "custo" in tipo or "saída" in tipo or "saida" in tipo:
+                            despesas_prev += valor
+                            if l.get("realizado") and l.get("dataRealizada"):
+                                despesas_real += valor
+                    except Exception:
+                        pass
+                if despesas_prev > 0:
+                    delta = despesas_real - despesas_prev
+                    situ = "Abaixo do previsto" if delta <= 0 else "Acima do previsto"
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("Custos planejados", f"R$ {despesas_prev:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+                    with c2:
+                        st.metric("Custos realizados", f"R$ {despesas_real:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+                    with c3:
+                        st.metric("Situação (custo)", situ, delta=f"R$ {delta:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+            except Exception:
+                pass
         else:
             st.warning("Defina a data de início no TAP para gerar a Curva S de trabalho.")
     else:
