@@ -296,10 +296,11 @@ def _insert_event(SessionLocal, project_id: int, doc_task_id: int, status: str,
 
 
 def _upsert_doc_tasks(SessionLocal, project_id: int, rows: pd.DataFrame, services_map: Dict[int, str],
-                      project_number: str) -> Tuple[int, int]:
+                      project_number: str) -> Tuple[int, int, int]:
     """Upsert + eventos. Retorna (inseridos, atualizados)."""
     inserted = 0
     updated = 0
+    deleted = 0
 
     for _, r in rows.iterrows():
         rid = r.get("id", None)
@@ -330,9 +331,11 @@ def _upsert_doc_tasks(SessionLocal, project_id: int, rows: pd.DataFrame, service
         # --------- DELETE ---------
         if delete_flag and rid not in (None, "", pd.NA) and not pd.isna(rid):
             with SessionLocal() as session:
-                session.execute(text("DELETE FROM project_doc_tasks WHERE id=:id"), {"id": int(rid)})
+                # apaga eventos primeiro (evita violação de FK)
                 session.execute(text("DELETE FROM doc_status_events WHERE doc_task_id=:id"), {"id": int(rid)})
+                session.execute(text("DELETE FROM project_doc_tasks WHERE id=:id"), {"id": int(rid)})
                 session.commit()
+            deleted += 1
             continue
 
         # --------- INSERT ---------
@@ -437,9 +440,7 @@ def _upsert_doc_tasks(SessionLocal, project_id: int, rows: pd.DataFrame, service
                 event_date = delivery_dt
             _insert_event(SessionLocal, project_id, rid_int, status, event_date, revision_code)
 
-    return inserted, updated
-
-
+    return inserted, updated, deleted
 def _compute_doc_metrics(engine, project_id: int) -> pd.DataFrame:
     """Retorna DF por doc_task_id com tempos BK/Cliente e revisões."""
     sql = text("""
@@ -542,7 +543,15 @@ def _build_doc_report_html(project_name: str, client_name: str, logo_bk_b64: str
                            doc_table: pd.DataFrame, metrics: pd.DataFrame) -> str:
     # merge
     rep = doc_table.merge(metrics, left_on="id", right_on="doc_task_id", how="left")
-    rep = rep.fillna({"dias_elaboracao_BK":0,"dias_revisao_BK":0,"dias_analise_CLIENTE":0,"revisoes_qtd":0,"dias_total":0,"revision_code":"R0A"})
+    rep = rep.fillna({
+        "dias_elaboracao_BK": 0,
+        "dias_revisao_BK": 0,
+        "dias_analise_CLIENTE": 0,
+        "revisoes_qtd": 0,
+        "dias_total": 0,
+        "revision_code": "R0A"
+    })
+
     # charts
     top = rep.sort_values("dias_total", ascending=False).head(10)
     top_rev = rep.sort_values("dias_revisao_BK", ascending=False).head(10)
@@ -551,10 +560,10 @@ def _build_doc_report_html(project_name: str, client_name: str, logo_bk_b64: str
 
     charts = []
     for dfx, y, ttl in [
-        (top, "dias_total", "Top 10 - Tempo total (BK+Cliente)"),
+        (top, "dias_total", "Top 10 - Tempo total (BK + Cliente)"),
         (top_ana, "dias_analise_CLIENTE", "Top 10 - Análise (Cliente)"),
         (top_rev, "dias_revisao_BK", "Top 10 - Revisão (BK)"),
-        (top_revcount, "revisoes_qtd", "Top 10 - Qtde de revisões"),
+        (top_revcount, "revisoes_qtd", "Top 10 - Nº de revisões"),
     ]:
         if dfx.empty:
             charts.append("")
@@ -565,74 +574,123 @@ def _build_doc_report_html(project_name: str, client_name: str, logo_bk_b64: str
         charts.append(f'<img src="data:image/png;base64,{b64}" style="max-width:100%;height:auto;" />' if b64 else "")
 
     # table html
-    cols = ["id","service_name","complemento","project_number","start_date","delivery_date","status","revision_code","revisoes_qtd",
-            "dias_elaboracao_BK","dias_revisao_BK","dias_analise_CLIENTE","dias_total","observation"]
+    cols = [
+        "service_name", "complemento", "project_number",
+        "start_date", "delivery_date",
+        "status", "revision_code", "revisoes_qtd",
+        "dias_elaboracao_BK", "dias_revisao_BK", "dias_analise_CLIENTE", "dias_total",
+        "observation"
+    ]
     for c in cols:
         if c not in rep.columns:
             rep[c] = ""
     th = "".join([f"<th>{_html_escape(c)}</th>" for c in cols])
     rows_html = []
     for _, r in rep[cols].iterrows():
-        tds = "".join([f"<td>{_html_escape(str(r.get(c,'')))}</td>" for c in cols])
+        tds = "".join([f"<td>{_html_escape(r.get(c,''))}</td>" for c in cols])
         rows_html.append(f"<tr>{tds}</tr>")
-    table_html = f"""
-    <table>
-      <thead><tr>{th}</tr></thead>
-      <tbody>{''.join(rows_html) if rows_html else '<tr><td colspan="14">Sem dados</td></tr>'}</tbody>
-    </table>
-    """
+    table_html = f"<table><thead><tr>{th}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
 
-    logo_bk = f'<img src="data:image/png;base64,{logo_bk_b64}" style="height:52px" />' if logo_bk_b64 else ""
-    logo_cli = f'<img src="data:image/png;base64,{logo_cli_b64}" style="height:52px" />' if logo_cli_b64 else ""
-
-    total_revs = int(rep["revisoes_qtd"].sum()) if not rep.empty else 0
+    def _img(b64: str) -> str:
+        if not b64:
+            return ""
+        return f'<img src="data:image/png;base64,{b64}" style="max-height:80px;max-width:160px;object-fit:contain;" />'
 
     return f"""<!doctype html>
 <html lang="pt-br">
 <head>
-<meta charset="utf-8"/>
-<title>Controle de Projetos - { _html_escape(project_name) }</title>
+<meta charset="utf-8" />
+<title>Controle de Projetos - Relatório</title>
 <style>
-body{{font-family: Arial, sans-serif; margin:24px;}}
-.header{{display:flex;align-items:center;justify-content:space-between;gap:16px;}}
-h1{{margin:0;}}
-.badge{{display:inline-block;padding:4px 10px;border-radius:12px;background:#eef;border:1px solid #ccd;}}
-.grid{{display:grid;grid-template-columns:1fr;gap:14px;margin-top:14px;}}
-.card{{border:1px solid #ddd;border-radius:12px;padding:12px;}}
-table{{border-collapse:collapse;width:100%;font-size:12px;}}
-th,td{{border:1px solid #ddd;padding:6px;vertical-align:top;}}
-th{{background:#f7f7f7;}}
+    body {{
+        font-family: Arial, Helvetica, sans-serif;
+        margin: 24px;
+        color: #111827;
+    }}
+    .header {{
+        display: grid;
+        grid-template-columns: 180px 1fr 180px;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 0 18px 0;
+        border-bottom: 1px solid #e5e7eb;
+        margin-bottom: 18px;
+    }}
+    .title {{
+        text-align: center;
+        font-size: 24px;
+        font-weight: 800;
+        letter-spacing: 0.2px;
+    }}
+    .subtitle {{
+        text-align: center;
+        margin-top: 6px;
+        font-size: 14px;
+        color: #374151;
+    }}
+    .meta {{
+        margin: 10px 0 14px 0;
+        font-size: 13px;
+        color: #374151;
+    }}
+    table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+    }}
+    th, td {{
+        border: 1px solid #d1d5db; /* cinza claro */
+        padding: 6px 8px;
+        vertical-align: top;
+    }}
+    th {{
+        background: #f3f4f6;
+        text-transform: none;
+        font-weight: 700;
+    }}
+    .section {{
+        margin-top: 18px;
+    }}
+    .section h2 {{
+        font-size: 16px;
+        margin: 0 0 10px 0;
+    }}
+    .charts img {{
+        margin: 10px 0;
+    }}
 </style>
 </head>
 <body>
+
 <div class="header">
-  <div>{logo_bk}</div>
-  <div style="text-align:center">
-    <h1>Controle de Projetos</h1>
-    <div class="badge"><b>Projeto:</b> {_html_escape(project_name)} | <b>Cliente:</b> {_html_escape(client_name)}</div>
-    <div class="badge"><b>Total de revisões (projeto):</b> {total_revs}</div>
+  <div style="text-align:left;">{_img(logo_bk_b64)}</div>
+  <div>
+    <div class="title">BK Engenharia e Tecnologia</div>
+    <div class="subtitle">Relatório - Controle de Projetos</div>
   </div>
-  <div>{logo_cli}</div>
+  <div style="text-align:right;">{_img(logo_cli_b64)}</div>
 </div>
 
-<div class="grid">
-  <div class="card">
-    <h2>Gráficos</h2>
-    {charts[0]}<br/>
-    {charts[1]}<br/>
-    {charts[2]}<br/>
-    {charts[3]}<br/>
-  </div>
-
-  <div class="card">
-    <h2>Tabela completa</h2>
-    {table_html}
-  </div>
+<div class="meta">
+  <div><b>Cliente:</b> {_html_escape(client_name)}</div>
+  <div><b>Projeto:</b> {_html_escape(project_name)}</div>
 </div>
+
+<div class="section">
+  <h2>Tarefas / Documentos</h2>
+  {table_html}
+</div>
+
+<div class="section charts">
+  <h2>Gráficos</h2>
+  {charts[0]}
+  {charts[1]}
+  {charts[2]}
+  {charts[3]}
+</div>
+
 </body>
-</html>
-"""
-
+</html>"""
 
 # -------------------------
 # Página
@@ -703,6 +761,8 @@ def main() -> None:
         # services
         services_df = _list_services(engine)
         services_map = {int(r.id): str(r.name) for r in services_df.itertuples()} if not services_df.empty else {}
+        services_name_to_id = {v: k for k, v in services_map.items()}
+        service_names = sorted(list(services_name_to_id.keys()))
         service_labels = {f"{int(r.id)} - {r.name}": int(r.id) for r in services_df.itertuples()} if not services_df.empty else {}
         # data
         doc_df = _list_doc_tasks(engine, SessionLocal, pid)
@@ -715,16 +775,49 @@ def main() -> None:
         doc_edit = doc_df.copy()
         doc_edit["Excluir"] = False
 
+
+# formulário rápido para adicionar uma linha (deixa claro onde informar o serviço)
+with st.expander("➕ Adicionar tarefa/documento", expanded=False):
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        new_service = st.selectbox("Tarefa (Serviço)", service_names if 'service_names' in locals() else [], index=0 if (('service_names' in locals()) and service_names) else None)
+    with c2:
+        new_start = st.date_input("Data de início", value=date.today(), key="new_doc_start")
+    with c3:
+        new_delivery = st.date_input("Data de conclusão (entrega p/ análise)", value=date.today(), key="new_doc_delivery")
+    new_comp = st.text_input("Complemento", key="new_doc_comp")
+    new_obs = st.text_area("Observação", key="new_doc_obs")
+    if st.button("Adicionar linha", use_container_width=True):
+        if not new_service:
+            st.warning("Selecione um serviço.")
+        else:
+            sid = services_name_to_id.get(str(new_service), None) if 'services_name_to_id' in locals() else None
+            df_new = pd.DataFrame([{
+                "id": None,
+                "service_id": sid,
+                "service_name": str(new_service),
+                "complemento": new_comp,
+                "project_number": proj_number,
+                "start_date": new_start,
+                "delivery_date": new_delivery,
+                "status": "Em andamento - BK",
+                "revision_code": "R0A",
+                "observation": new_obs,
+                "Excluir": False,
+            }])
+            _upsert_doc_tasks(SessionLocal, pid, df_new, services_map, proj_number)
+            st.success("Linha adicionada.")
+            st.rerun()
+
         # editor column config
         col_cfg = {
             "id": st.column_config.NumberColumn("ID", disabled=True),
-            "service_id": st.column_config.SelectboxColumn(
-                "Tarefa (Serviços)",
-                options=list(services_map.keys()) if services_map else [],
-                help="Selecione pelo ID do serviço/produto cadastrado (pesquise digitando).",
-                required=False,
+            "service_name": st.column_config.SelectboxColumn(
+                "Tarefa (Serviço)",
+                options=service_names if 'service_names' in locals() else [],
+                help="Selecione o serviço (digite para pesquisar).",
+                required=True,
             ),
-            "service_name": st.column_config.TextColumn("Tarefa (descrição)", help="Preenchido automaticamente pelo serviço; pode ajustar manualmente.", required=False),
             "complemento": st.column_config.TextColumn("Complemento", required=False),
             "project_number": st.column_config.TextColumn("Nº do projeto", disabled=True),
             "start_date": st.column_config.DateColumn("Data de início", required=True),
@@ -743,8 +836,12 @@ def main() -> None:
         if "revision_code" in doc_edit.columns and doc_edit["revision_code"].isna().any():
             doc_edit["revision_code"] = doc_edit["revision_code"].fillna("R0A")
 
+        doc_edit_view = doc_edit.copy()
+        # esconder colunas técnicas
+        if 'service_id' in doc_edit_view.columns:
+            doc_edit_view = doc_edit_view.drop(columns=['service_id'])
         edited = st.data_editor(
-            doc_edit,
+            doc_edit_view,
             num_rows="dynamic",
             use_container_width=True,
             column_config=col_cfg,
@@ -752,23 +849,14 @@ def main() -> None:
             key="doc_editor",
         )
 
-        # pós-processamento: preencher service_name ao selecionar service_id
+        # pós-processamento: mapear service_name -> service_id
         edited_df = pd.DataFrame(edited)
-        if not edited_df.empty and services_map:
-            def _fill_name(rowx):
-                sid = rowx.get("service_id", None)
-                try:
-                    sid_i = int(sid) if sid not in (None,"") and not pd.isna(sid) else None
-                except Exception:
-                    sid_i = None
-                if sid_i is not None:
-                    rowx["service_name"] = services_map.get(sid_i, rowx.get("service_name",""))
-                return rowx
-            edited_df = edited_df.apply(_fill_name, axis=1)
+        if not edited_df.empty and services_name_to_id:
+            edited_df['service_id'] = edited_df.get('service_name', '').map(lambda n: services_name_to_id.get(str(n), None))
 
         if st.button("💾 Salvar tabela", type="primary", use_container_width=True):
-            ins, upd = _upsert_doc_tasks(SessionLocal, pid, edited_df, services_map, proj_number)
-            st.success(f"Salvo. Inseridos: {ins} | Atualizados: {upd}.")
+            ins, upd, dele = _upsert_doc_tasks(SessionLocal, pid, edited_df, services_map, proj_number)
+            st.success(f"Salvo. Inseridos: {ins} | Atualizados: {upd} | Excluídos: {dele}.")
             st.rerun()
 
         st.divider()
