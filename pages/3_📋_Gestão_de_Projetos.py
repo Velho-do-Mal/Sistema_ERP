@@ -3,6 +3,7 @@ import streamlit.components.v1 as components  # IMPORT CORRETO PARA HTML
 import psycopg2
 import json
 from datetime import datetime, date, timedelta
+import datetime as dt
 import pandas as pd
 import plotly.express as px
 from bk_erp_shared.theme import apply_theme
@@ -274,358 +275,35 @@ def delete_project(project_id: int):
 # --------------------------------------------------------
 
 def calcular_cpm(tasks):
+    """
+    Mantido por compatibilidade com versões anteriores.
+    Agora apenas devolve as tarefas com ES/EF calculados (dias) a partir do cronograma planejado.
+    """
     if not tasks:
         return tasks, 0
+    # Reusa o agendamento por datas e converte para offsets (dias desde início do projeto)
+    tasks_sched, proj_start, proj_end = schedule_eap(tasks)
+    if not proj_start or not proj_end:
+        return tasks, 0
 
-    tasks = [dict(t) for t in tasks]
-    mapa = {t["codigo"]: t for t in tasks}
-
-    for t in tasks:
-        t["es"] = 0
-        t["ef"] = 0
-        t["ls"] = 0
-        t["lf"] = 0
-        t["slack"] = 0
-
-    max_iter = 1000
-    for _ in range(max_iter):
-        atualizado = False
-        for t in tasks:
-            dur = int(t.get("duracao") or 0)
-            preds = t.get("predecessoras") or []
-            rel = t.get("relacao") or "FS"
-
-            if preds:
-                max_start = 0
-                todos_ok = True
-                for cod in preds:
-                    p = mapa.get(cod)
-                    if not p:
-                        todos_ok = False
-                        break
-                    if rel in ("FS", "FF"):
-                        cand = p.get("ef", 0)
-                    else:
-                        cand = p.get("es", 0)
-                    if cand > max_start:
-                        max_start = cand
-                if not todos_ok:
-                    continue
-                if t["ef"] == 0:
-                    t["es"] = max_start
-                    t["ef"] = t["es"] + dur
-                    atualizado = True
-            else:
-                if t["ef"] == 0:
-                    t["es"] = 0
-                    t["ef"] = dur
-                    atualizado = True
-        if not atualizado:
-            break
-
-    projeto_fim = max((t["ef"] for t in tasks), default=0)
-
-    succ_map = {t["codigo"]: [] for t in tasks}
-    for t in tasks:
-        for cod_p in (t.get("predecessoras") or []):
-            if cod_p in succ_map:
-                succ_map[cod_p].append(t["codigo"])
-
-    ordem = sorted(tasks, key=lambda x: x["es"], reverse=True)
-    for t in ordem:
-        cod = t["codigo"]
-        dur = int(t.get("duracao") or 0)
-        succs = succ_map.get(cod) or []
-        if not succs:
-            t["lf"] = projeto_fim
-            t["ls"] = projeto_fim - dur
+    for t in tasks_sched:
+        ps = t.get("_ps")
+        pf = t.get("_pf")
+        if ps and pf:
+            t["es"] = int((ps - proj_start).days)
+            t["ef"] = int((pf - proj_start).days)
         else:
-            min_ls = None
-            for scod in succs:
-                s = mapa[scod]
-                if s["lf"] == 0:
-                    s["lf"] = s["ef"]
-                    s["ls"] = s["lf"] - int(s.get("duracao") or 0)
-                if (min_ls is None) or (s["ls"] < min_ls):
-                    min_ls = s["ls"]
-            if min_ls is None:
-                min_ls = projeto_fim - dur
-            t["lf"] = min_ls
-            t["ls"] = t["lf"] - dur
+            t["es"] = 0
+            t["ef"] = int(t.get("duracao") or 0)
 
-        t["slack"] = t["ls"] - t["es"]
+    projeto_fim = int((proj_end - proj_start).days) if proj_start and proj_end else 0
+    return tasks_sched, projeto_fim
 
-    return tasks, projeto_fim
+def gerar_curva_s_trabalho(*args, **kwargs):
+    return None
 
-
-
-def _parse_iso_date(s: str):
-    try:
-        if not s:
-            return None
-        return datetime.fromisoformat(str(s)).date()
-    except Exception:
-        try:
-            return pd.to_datetime(str(s), errors="coerce").date()
-        except Exception:
-            return None
-
-
-def calcular_eap_pmbok(eap_tasks, data_inicio_str: str):
-    """Calcula início/fim (dias corridos) considerando predecessoras e hierarquia (PMBOK/WBS).
-
-    Regras:
-    - Atividades folha: início depende das predecessoras e fim = início + duração (dias corridos).
-    - Relações: FS/SS/FF/SF (simplificado).
-    - Atividades com subníveis viram 'sumário': início = min(inícios dos filhos), fim = max(fins dos filhos),
-      duração = (fim - início) em dias.
-    """
-    if not eap_tasks:
-        return []
-
-    start_date = _parse_iso_date(data_inicio_str) or date.today()
-
-    tasks = [dict(t) for t in eap_tasks]
-    by_code = {str(t.get("codigo") or "").strip(): t for t in tasks if str(t.get("codigo") or "").strip()}
-    codes = list(by_code.keys())
-
-    # detectar hierarquia por prefixo "1.2" -> pai "1"
-    children = {c: [] for c in codes}
-    parents = set()
-    for c in codes:
-        prefix = c + "."
-        for other in codes:
-            if other.startswith(prefix):
-                children[c].append(other)
-                parents.add(c)
-
-    # folhas
-    leaf_codes = [c for c in codes if c not in parents]
-
-    # map pai -> folhas descendentes
-    leaf_by_parent = {}
-    for p in parents:
-        pref = p + "."
-        leaf_by_parent[p] = [lc for lc in leaf_codes if lc.startswith(pref)]
-
-    def _expand_preds(pred_list):
-        out = []
-        for p in pred_list or []:
-            p = str(p).strip()
-            if not p:
-                continue
-            if p in leaf_by_parent:
-                out.extend(leaf_by_parent[p])
-            else:
-                out.append(p)
-        # unique mantendo ordem
-        seen=set()
-        uniq=[]
-        for x in out:
-            if x not in seen:
-                uniq.append(x); seen.add(x)
-        return uniq
-
-    # preparar folhas para cálculo
-    leaf = {c: by_code[c] for c in leaf_codes}
-    for c,t in leaf.items():
-        t["_preds"] = _expand_preds(t.get("predecessoras") or [])
-        t["_rel"] = (t.get("relacao") or "FS").upper()
-        t["_dur"] = int(t.get("duracao") or 0) or 0
-        t["_es"] = None
-        t["_ef"] = None
-
-    # forward pass iterativo (sem considerar calendário útil; dias corridos)
-    for _ in range(2000):
-        changed = False
-        for c,t in leaf.items():
-            if t["_ef"] is not None:
-                continue
-            preds = t["_preds"]
-            rel = t["_rel"]
-            dur = t["_dur"]
-            if not preds:
-                t["_es"] = 0
-                t["_ef"] = 0 + dur
-                changed = True
-                continue
-            ok=True
-            # calcula es conforme relação
-            starts=[]
-            finishes=[]
-            for pc in preds:
-                pt = leaf.get(pc)
-                # se predecessor não for folha, ignora (evita quebrar)
-                if not pt or pt["_ef"] is None or pt["_es"] is None:
-                    ok=False
-                    break
-                starts.append(pt["_es"])
-                finishes.append(pt["_ef"])
-            if not ok:
-                continue
-
-            if rel == "FS":
-                es = max(finishes)
-            elif rel == "SS":
-                es = max(starts)
-            elif rel == "FF":
-                es = max(finishes) - dur
-            elif rel == "SF":
-                es = max(starts) - dur
-            else:
-                es = max(finishes)
-
-            if es < 0:
-                es = 0
-            t["_es"] = es
-            t["_ef"] = es + dur
-            changed = True
-        if not changed:
-            break
-
-    # converter folhas para datas
-    for c,t in leaf.items():
-        es = int(t.get("_es") or 0)
-        ef = int(t.get("_ef") or 0)
-        t["data_inicio_calc"] = (start_date + timedelta(days=es)).isoformat()
-        t["data_fim_calc"] = (start_date + timedelta(days=ef)).isoformat()
-
-    # rollup para tarefas sumário (pais), do nível mais profundo para cima
-    def _desc_leaves(pcode):
-        return leaf_by_parent.get(pcode) or []
-
-    # ordena pais por profundidade (mais profundo primeiro)
-    parent_codes = sorted(list(parents), key=lambda x: x.count("."), reverse=True)
-    for pc in parent_codes:
-        desc = _desc_leaves(pc)
-        if not desc:
-            continue
-        starts = []
-        ends = []
-        for lc in desc:
-            lt = leaf.get(lc)
-            if not lt:
-                continue
-            s = _parse_iso_date(lt.get("data_inicio_calc") or "")
-            e = _parse_iso_date(lt.get("data_fim_calc") or "")
-            if s: starts.append(s)
-            if e: ends.append(e)
-        if not starts or not ends:
-            continue
-        smin = min(starts)
-        emax = max(ends)
-        pt = by_code.get(pc)
-        if pt is None:
-            continue
-        pt["data_inicio_calc"] = smin.isoformat()
-        pt["data_fim_calc"] = emax.isoformat()
-        pt["duracao_calc"] = (emax - smin).days  # dias corridos (fim = início + duração)
-
-    # para folhas, duracao_calc = duracao original
-    for c,t in leaf.items():
-        t["duracao_calc"] = int(t.get("_dur") or 0)
-
-    # retorna lista no mesmo formato do eap_tasks, com campos extras
-    out=[]
-    for c in sorted(codes):
-        t = by_code[c]
-        out.append(t)
-    return out
-
-
-
-def gerar_curva_s_trabalho(tasks, data_inicio_str):
-    if not tasks or not data_inicio_str:
-        return None
-
-    tasks_cpm, total_dias = calcular_cpm(tasks)
-    if total_dias <= 0:
-        return None
-
-    soma_duracoes = sum(int(t.get("duracao") or 0) for t in tasks_cpm)
-    if soma_duracoes <= 0:
-        return None
-
-    dias = list(range(0, total_dias + 1))
-    progresso = []
-
-    for d in dias:
-        acum = 0
-        for t in tasks_cpm:
-            dur = int(t.get("duracao") or 0)
-            es = t.get("es", 0)
-            peso = dur / soma_duracoes if soma_duracoes > 0 else 0
-            if d <= es:
-                frac = 0
-            elif d >= es + dur:
-                frac = 1
-            else:
-                frac = (d - es) / dur
-            acum += peso * frac
-        progresso.append(acum * 100.0)
-
-    df = pd.DataFrame(
-        {
-            "Dia do Projeto": dias,
-            "Progresso (%)": progresso,
-        }
-    )
-    fig = px.line(
-        df,
-        x="Dia do Projeto",
-        y="Progresso (%)",
-        title=f"Curva S de Trabalho (a partir de {data_inicio_str})",
-    )
-    fig.update_traces(mode="lines+markers")
-    fig.update_layout(
-        template="plotly_dark",
-        height=350,
-        margin=dict(l=30, r=20, t=35, b=30),
-    )
-    return fig
-
-
-def gerar_gantt(tasks, data_inicio_str):
-    """
-    Gera um gráfico de Gantt simplificado a partir das tarefas (usa es/ef gerados pelo CPM).
-    """
-    if not tasks or not data_inicio_str:
-        return None
-    tasks_cpm, projeto_fim = calcular_cpm(tasks)
-    try:
-        data_inicio_dt = datetime.strptime(data_inicio_str, "%Y-%m-%d").date()
-    except Exception:
-        return None
-    rows = []
-    for t in tasks_cpm:
-        es = int(t.get("es", 0))
-        ef = int(t.get("ef", 0))
-        start = data_inicio_dt + timedelta(days=es)
-        finish = data_inicio_dt + timedelta(days=ef)
-        rows.append(
-            {
-                "Task": f"{t.get('codigo')} - {t.get('descricao')}",
-                "Start": start,
-                "Finish": finish,
-                "Resource": t.get("responsavel", ""),
-            }
-        )
-    if not rows:
-        return None
-    dfg = pd.DataFrame(rows)
-    fig = px.timeline(dfg, x_start="Start", x_end="Finish", y="Task", color="Resource")
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(
-        template="plotly_dark",
-        height=350,
-        margin=dict(l=30, r=20, t=35, b=30),
-    )
-    return fig
-
-
-# --------------------------------------------------------
-# FINANCEIRO / CURVA S FINANCEIRA
-# --------------------------------------------------------
+def gerar_gantt(*args, **kwargs):
+    return None
 
 def adicionar_dias(dt: date, qtd: int) -> date:
     return dt + timedelta(days=qtd)
@@ -1185,28 +863,38 @@ with tabs[2]:
     st.markdown("### 📦 Estrutura Analítica do Projeto (EAP)")
 
     with st.expander("Cadastrar atividade na EAP", expanded=True):
-        c1, c2, c3, c4 = st.columns([1, 2, 1, 1])
+        c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 1, 1])
         with c1:
             codigo = st.text_input("Código (1.2.3)", key="eap_codigo")
-            nivel = st.selectbox("Nível", [1, 2, 3, 4], index=0, key="eap_nivel")
         with c2:
-            descricao = st.text_input("Descrição da atividade", key="eap_descricao")
+            nivel = st.selectbox("Nível", [1, 2, 3, 4], index=0, key="eap_nivel")
         with c3:
-            duracao = st.number_input(
-                "Duração (dias)", min_value=1, value=1, key="eap_dur"
-            )
+            descricao = st.text_input("Descrição da atividade", key="eap_descricao")
         with c4:
+            duracao = st.number_input("Duração (dias corridos)", min_value=1, value=1, key="eap_dur")
+        with c5:
             responsavel = st.text_input("Responsável", key="eap_resp")
+
+        st.markdown("**Datas planejadas e reais**")
+        d1, d2, d3, d4 = st.columns([1, 1, 1, 1])
+        with d1:
+            inicio_planejado = st.date_input("Início planejado", value=dt.date.today(), key="eap_inicio_plan")
+        with d2:
+            fim_planejado_prev = inicio_planejado + dt.timedelta(days=int(duracao))
+            st.date_input("Fim planejado (calculado)", value=fim_planejado_prev, disabled=True, key="eap_fim_plan_view")
+        with d3:
+            has_inicio_real = st.checkbox("Definir início real", value=False, key="eap_has_inicio_real")
+            inicio_real = st.date_input("Início real", value=dt.date.today(), key="eap_inicio_real") if has_inicio_real else None
+        with d4:
+            has_fim_real = st.checkbox("Definir fim real", value=False, key="eap_has_fim_real")
+            fim_real = st.date_input("Fim real", value=dt.date.today(), key="eap_fim_real") if has_fim_real else None
 
         col_pp, col_rel, col_stat = st.columns([2, 1, 1])
         with col_pp:
-            predecessoras_str = st.text_input(
-                "Predecessoras (códigos separados por vírgula)", key="eap_pred"
-            )
+            predecessoras_str = st.text_input("Predecessoras (códigos separados por vírgula)", key="eap_pred")
         with col_rel:
-            relacao = st.selectbox(
-                "Relação", ["FS", "FF", "SS", "SF"], index=0, key="eap_rel"
-            )
+            _relation_tooltip()
+            relacao = st.selectbox("Relação", ["FS", "FF", "SS", "SF"], index=0, key="eap_rel")
         with col_stat:
             status = st.selectbox(
                 "Status",
@@ -1231,6 +919,9 @@ with tabs[2]:
                         "duracao": int(duracao),
                         "relacao": relacao,
                         "status": status,
+                        "inicio_planejado": inicio_planejado.strftime("%Y-%m-%d"),
+                        "inicio_real": inicio_real.strftime("%Y-%m-%d") if inicio_real else "",
+                        "fim_real": fim_real.strftime("%Y-%m-%d") if fim_real else "",
                     }
                 )
                 salvar_estado()
@@ -1241,70 +932,39 @@ with tabs[2]:
         st.markdown("#### Tabela de atividades da EAP")
 
         # Indentação conforme nível (1..4) - usando NBSP para preservar espaços
-        df_eap = pd.DataFrame(eapTasks)
+
+        tasks_sched, _proj_start, _proj_end = schedule_eap(eapTasks)
+        for _t in tasks_sched:
+            _t["inicio_previsto"] = _iso(_t.get("_ps"))
+            _t["fim_previsto"] = _iso(_t.get("_pf"))
+            # mantém as strings salvas (se existirem)
+            _t["inicio_planejado"] = _t.get("inicio_planejado") or ""
+            _t["inicio_real"] = _t.get("inicio_real") or ""
+            _t["fim_real"] = _t.get("fim_real") or ""
+        df_eap = pd.DataFrame(tasks_sched)
         df_eap_sorted = df_eap.sort_values(by="codigo")
         df_eap_display = df_eap_sorted.copy()
         def indent_desc(row):
             niv = int(row.get("nivel", 1)) if row.get("nivel") else 1
             return ("\u00A0" * 4 * (niv - 1)) + str(row.get("descricao", ""))
         df_eap_display["descricao"] = df_eap_display.apply(indent_desc, axis=1)
-
-        # Calcula cronograma (PMBOK) usando data de início do projeto (TAP)
-        data_inicio_proj = (tap.get("dataInicio") or "").strip()
-        eap_calc = calcular_eap_pmbok(eapTasks, data_inicio_proj)
-        df_calc = pd.DataFrame(eap_calc)
-
-        # adiciona colunas calculadas (início/fim/duração)
-        if not df_calc.empty:
-            df_eap_display = df_eap_display.merge(
-                df_calc[["id", "data_inicio_calc", "data_fim_calc", "duracao_calc"]],
-                on="id",
-                how="left",
-            )
-            # formata para exibição
-            def _fmt_d(x):
-                try:
-                    d = pd.to_datetime(x, errors="coerce")
-                    return "" if pd.isna(d) else d.strftime("%d/%m/%Y")
-                except Exception:
-                    return str(x or "")
-            df_eap_display["inicio"] = df_eap_display["data_inicio_calc"].apply(_fmt_d)
-            df_eap_display["fim"] = df_eap_display["data_fim_calc"].apply(_fmt_d)
-            df_eap_display["duracao_pmbok"] = df_eap_display["duracao_calc"]
-        else:
-            df_eap_display["inicio"] = ""
-            df_eap_display["fim"] = ""
-            df_eap_display["duracao_pmbok"] = df_eap_display.get("duracao")
-
-
         # Exibe a tabela com a descrição indentada
         try:
-            cols_show = [c for c in ["codigo","nivel","descricao","responsavel","predecessoras","relacao","duracao","duracao_pmbok","inicio","fim","status"] if c in df_eap_display.columns]
-            st.dataframe(df_eap_display[cols_show], use_container_width=True, height=320)
+            st.dataframe(df_eap_display.drop(columns=["id"]), use_container_width=True, height=260)
         except Exception:
             st.dataframe(df_eap_display, use_container_width=True, height=260)
 
-
-        st.markdown("#### 📄 Relatório EAP (Status)")
-        st.caption("Exporta apenas a EAP com início/fim (PMBOK) e status de cada atividade.")
-        df_rep = df_eap_display.copy()
-        rep_cols = [c for c in ["codigo","descricao","nivel","inicio","fim","duracao_pmbok","status"] if c in df_rep.columns]
-        df_rep = df_rep[rep_cols].rename(columns={"duracao_pmbok":"duracao_dias"})
-        st.dataframe(df_rep, use_container_width=True, hide_index=True, height=260)
-
-        # downloads
-        csv_bytes = df_rep.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Baixar CSV", data=csv_bytes, file_name="relatorio_eap_status.csv", mime="text/csv")
-
-        try:
-            import io
-            bio = io.BytesIO()
-            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-                df_rep.to_excel(writer, index=False, sheet_name="EAP_Status")
-            st.download_button("⬇️ Baixar Excel", data=bio.getvalue(), file_name="relatorio_eap_status.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception:
-            st.caption("Excel indisponível (dependência openpyxl). Use CSV.")
-
+        with st.expander("📄 Relatório EAP (Status)", expanded=False):
+            cols = ["codigo", "descricao", "nivel", "inicio_previsto", "fim_previsto", "duracao", "status", "responsavel"]
+            df_rel = df_eap_sorted.copy()
+            # garante colunas
+            for c in cols:
+                if c not in df_rel.columns:
+                    df_rel[c] = ""
+            df_rel = df_rel[cols].sort_values(by="codigo")
+            st.dataframe(df_rel, use_container_width=True, height=320)
+            csv = df_rel.to_csv(index=False).encode("utf-8")
+            st.download_button("Baixar CSV", data=csv, file_name="relatorio_eap_status.csv", mime="text/csv")
 
         idx_eap = st.selectbox(
             "Selecione a atividade para editar / excluir",
@@ -1352,6 +1012,23 @@ with tabs[2]:
                     key="eap_edit_resp"
                 )
 
+            st.markdown("**Datas planejadas e reais (edição)**")
+            ed1, ed2, ed3, ed4 = st.columns([1, 1, 1, 1])
+            with ed1:
+                inicio_plan_default = _parse_date(tarefa_sel.get("inicio_planejado")) or dt.date.today()
+                inicio_planejado_edit = st.date_input("Início planejado (edição)", value=inicio_plan_default, key="eap_edit_inicio_plan")
+            with ed2:
+                fim_plan_calc = inicio_planejado_edit + dt.timedelta(days=int(tarefa_sel.get("duracao", 1)))
+                st.date_input("Fim planejado (calculado)", value=fim_plan_calc, disabled=True, key="eap_edit_fim_plan_view")
+            with ed3:
+                has_inicio_real_e = st.checkbox("Definir início real", value=bool(_parse_date(tarefa_sel.get("inicio_real"))), key="eap_edit_has_inicio_real")
+                inicio_real_default = _parse_date(tarefa_sel.get("inicio_real")) or dt.date.today()
+                inicio_real_edit = st.date_input("Início real", value=inicio_real_default, key="eap_edit_inicio_real") if has_inicio_real_e else None
+            with ed4:
+                has_fim_real_e = st.checkbox("Definir fim real", value=bool(_parse_date(tarefa_sel.get("fim_real"))), key="eap_edit_has_fim_real")
+                fim_real_default = _parse_date(tarefa_sel.get("fim_real")) or dt.date.today()
+                fim_real_edit = st.date_input("Fim real", value=fim_real_default, key="eap_edit_fim_real") if has_fim_real_e else None
+
             ce5, ce6, ce7 = st.columns([2, 1, 1])
             with ce5:
                 preds_edit_str = ", ".join(tarefa_sel.get("predecessoras", []))
@@ -1394,6 +1071,9 @@ with tabs[2]:
                 ]
                 tarefa_sel["relacao"] = relacao_edit
                 tarefa_sel["status"] = status_edit
+                tarefa_sel["inicio_planejado"] = inicio_planejado_edit.strftime("%Y-%m-%d")
+                tarefa_sel["inicio_real"] = inicio_real_edit.strftime("%Y-%m-%d") if inicio_real_edit else ""
+                tarefa_sel["fim_real"] = fim_real_edit.strftime("%Y-%m-%d") if fim_real_edit else ""
                 salvar_estado()
                 st.success("Atividade atualizada.")
                 st.rerun()
