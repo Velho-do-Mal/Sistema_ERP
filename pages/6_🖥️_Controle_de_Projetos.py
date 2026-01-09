@@ -235,8 +235,9 @@ def _list_services(engine) -> pd.DataFrame:
 
 
 def _list_doc_tasks(engine, SessionLocal, project_id: int) -> pd.DataFrame:
+    """Lista linhas da tabela estilo Excel. Usa text()+conn para evitar erro de paramstyle no Cloud."""
     _ensure_doc_tables(SessionLocal)
-    sql = """
+    sql = text("""
         SELECT id, service_id, COALESCE(service_name,'') AS service_name,
                COALESCE(complemento,'') AS complemento,
                COALESCE(project_number,'') AS project_number,
@@ -247,8 +248,19 @@ def _list_doc_tasks(engine, SessionLocal, project_id: int) -> pd.DataFrame:
         FROM project_doc_tasks
         WHERE project_id=:pid
         ORDER BY id ASC
-    """
-    df = pd.read_sql(sql, engine, params={"pid": int(project_id)})
+    """)
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
+    except Exception:
+        # Se ainda não existir (ou migração atrasada), tenta garantir tabelas e retornar vazio ao invés de quebrar a página
+        try:
+            _ensure_doc_tables(SessionLocal)
+            with engine.connect() as conn:
+                df = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
+        except Exception:
+            return pd.DataFrame(columns=['id', 'service_id', 'service_name', 'complemento', 'project_number', 'start_date', 'delivery_date', 'status', 'revision_code', 'observation'])
+
     # normalizar datas para date
     if "start_date" in df.columns:
         df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce").dt.date
@@ -430,14 +442,15 @@ def _upsert_doc_tasks(SessionLocal, project_id: int, rows: pd.DataFrame, service
 
 def _compute_doc_metrics(engine, project_id: int) -> pd.DataFrame:
     """Retorna DF por doc_task_id com tempos BK/Cliente e revisões."""
-    sql = """
+    sql = text("""
         SELECT doc_task_id, event_date, status, responsible, COALESCE(revision_code,'') AS revision_code
         FROM doc_status_events
         WHERE project_id=:pid
         ORDER BY doc_task_id ASC, event_date ASC, id ASC
-    """
+    """)
     try:
-        ev = pd.read_sql(sql, engine, params={"pid": int(project_id)})
+        with engine.connect() as conn:
+            ev = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
     except Exception:
         return pd.DataFrame()
 
