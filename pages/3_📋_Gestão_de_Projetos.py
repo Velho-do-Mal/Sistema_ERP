@@ -274,99 +274,175 @@ def delete_project(project_id: int):
 # --------------------------------------------------------
 
 def calcular_cpm(tasks):
+    """
+    Calcula ES/EF/LS/LF (em dias corridos) com base em predecessoras (padrão FS)
+    e respeitando tarefas-resumo (atividades com subtarefas), similar ao MS Project:
+
+    - Tarefas folha (sem filhos) são as que realmente "consomem" duração.
+    - Tarefas-resumo têm ES=min(ES dos filhos) e EF=max(EF dos filhos).
+    - Quando uma tarefa aponta como predecessora uma tarefa-resumo, considera-se o EF da resumo
+      (ou seja, o último término das subtarefas).
+    - Relaxação iterativa: recalcula até estabilizar (evita depender da ordem de inserção).
+    """
     if not tasks:
         return tasks, 0
 
     tasks = [dict(t) for t in tasks]
-    mapa = {t["codigo"]: t for t in tasks}
+    mapa = {t.get("codigo"): t for t in tasks if t.get("codigo")}
+
+    # Normaliza predecessoras para lista
+    for t in tasks:
+        preds = t.get("predecessoras") or []
+        if isinstance(preds, str):
+            preds = [x.strip() for x in preds.split(",") if x.strip()]
+        t["predecessoras"] = preds
+
+    # Mapa de filhos via código WBS (1.2.3)
+    children_map = {t["codigo"]: [] for t in tasks if t.get("codigo")}
+    for t in tasks:
+        cod = t.get("codigo")
+        if not cod:
+            continue
+        parts = cod.split(".")
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[:i])
+            if parent in children_map:
+                children_map[parent].append(cod)
 
     for t in tasks:
-        t["es"] = 0
-        t["ef"] = 0
+        cod = t.get("codigo")
+        t["is_summary"] = bool(cod and children_map.get(cod))
+        t["es"] = int(t.get("es") or 0)
+        t["ef"] = int(t.get("ef") or 0)
         t["ls"] = 0
         t["lf"] = 0
         t["slack"] = 0
 
-    max_iter = 1000
-    for _ in range(max_iter):
-        atualizado = False
-        for t in tasks:
-            dur = int(t.get("duracao") or 0)
-            preds = t.get("predecessoras") or []
-            rel = t.get("relacao") or "FS"
+    # Inicialização: folhas começam em 0
+    for t in tasks:
+        dur = int(t.get("duracao") or 0)
+        if t.get("is_summary"):
+            t["es"], t["ef"] = 0, 0
+        else:
+            t["es"], t["ef"] = 0, max(0, dur)
 
+    def _rollup_summaries():
+        changed = False
+        for t in tasks:
+            if not t.get("is_summary"):
+                continue
+            cod = t.get("codigo")
+            filhos = children_map.get(cod) or []
+            es_vals, ef_vals = [], []
+            for c in filhos:
+                child = mapa.get(c)
+                if not child:
+                    continue
+                es_vals.append(int(child.get("es") or 0))
+                ef_vals.append(int(child.get("ef") or 0))
+            if es_vals and ef_vals:
+                new_es = min(es_vals)
+                new_ef = max(ef_vals)
+                if new_es != t.get("es") or new_ef != t.get("ef"):
+                    t["es"], t["ef"] = new_es, new_ef
+                    changed = True
+        return changed
+
+    max_iter = 2000
+    for _ in range(max_iter):
+        updated = False
+
+        # 1) primeiro, atualiza resumos com base no que já existe
+        if _rollup_summaries():
+            updated = True
+
+        # 2) relaxa folhas conforme predecessoras
+        for t in tasks:
+            if t.get("is_summary"):
+                # resumo é derivada dos filhos; não recalcula por predecessoras aqui
+                continue
+
+            dur = int(t.get("duracao") or 0)
+            rel = (t.get("relacao") or "FS").strip().upper()
+            preds = t.get("predecessoras") or []
+
+            new_es = 0
             if preds:
                 max_start = 0
-                todos_ok = True
-                for cod in preds:
-                    p = mapa.get(cod)
+                ok = True
+                for cod_p in preds:
+                    p = mapa.get(cod_p)
                     if not p:
-                        todos_ok = False
+                        ok = False
                         break
-                    # MS Project (datas em dias corridos):
-                    # - FS: sucessora inicia no dia seguinte ao término da predecessora
-                    # - SS: sucessora pode iniciar no mesmo dia do início da predecessora
-                    # - FF: término da sucessora acompanha o término da predecessora
-                    # - SF: término da sucessora acompanha o início da predecessora
-                    if rel == "FS":
-                        cand = int(p.get("ef", 0)) + 1
-                    elif rel == "SS":
-                        cand = int(p.get("es", 0))
-                    elif rel == "FF":
-                        cand = int(p.get("ef", 0)) - dur + 1
-                    elif rel == "SF":
-                        cand = int(p.get("es", 0)) - dur + 1
-                    else:
-                        cand = int(p.get("ef", 0)) + 1
-                    if cand < 0:
-                        cand = 0
+                    # se predecessora é resumo, usa EF rolado
+                    cand = int(p.get("ef") or 0) if rel in ("FS", "FF") else int(p.get("es") or 0)
                     if cand > max_start:
                         max_start = cand
-                if not todos_ok:
-                    continue
-                if t["ef"] == 0:
-                    t["es"] = max_start
-                    t["ef"] = t["es"] + max(dur,1) - 1
-                    atualizado = True
-            else:
-                if t["ef"] == 0:
-                    t["es"] = 0
-                    t["ef"] = max(dur,1) - 1
-                    atualizado = True
-        if not atualizado:
+                if ok:
+                    new_es = max_start
+
+            new_ef = new_es + max(0, dur)
+
+            if new_es != int(t.get("es") or 0) or new_ef != int(t.get("ef") or 0):
+                t["es"], t["ef"] = new_es, new_ef
+                updated = True
+
+        # 3) atualiza resumos novamente após mover folhas
+        if _rollup_summaries():
+            updated = True
+
+        if not updated:
             break
 
-    projeto_fim = max((t["ef"] for t in tasks), default=0)
+    # Projeto termina no maior EF das folhas
+    projeto_fim = max((int(t.get("ef") or 0) for t in tasks if not t.get("is_summary")), default=0)
 
-    succ_map = {t["codigo"]: [] for t in tasks}
+    # ---------- Backward pass (folhas) ----------
+    # Sucessores (considera dependências diretas)
+    succ_map = {t["codigo"]: [] for t in tasks if t.get("codigo")}
     for t in tasks:
+        cod = t.get("codigo")
+        if not cod:
+            continue
         for cod_p in (t.get("predecessoras") or []):
             if cod_p in succ_map:
-                succ_map[cod_p].append(t["codigo"])
+                succ_map[cod_p].append(cod)
 
-    ordem = sorted(tasks, key=lambda x: x["es"], reverse=True)
+    # Ordena por ES decrescente (aproximação)
+    ordem = sorted([t for t in tasks if not t.get("is_summary")], key=lambda x: int(x.get("es") or 0), reverse=True)
     for t in ordem:
-        cod = t["codigo"]
         dur = int(t.get("duracao") or 0)
-        succs = succ_map.get(cod) or []
+        succs = succ_map.get(t.get("codigo") or "") or []
         if not succs:
             t["lf"] = projeto_fim
-            t["ls"] = projeto_fim - (max(dur,1) - 1)
+            t["ls"] = t["lf"] - dur
         else:
             min_ls = None
-            for scod in succs:
-                s = mapa[scod]
-                if s["lf"] == 0:
-                    s["lf"] = s["ef"]
-                    s["ls"] = s["lf"] - int(s.get("duracao") or 0)
-                if (min_ls is None) or (s["ls"] < min_ls):
-                    min_ls = s["ls"]
+            for s_cod in succs:
+                s = mapa.get(s_cod)
+                if not s or s.get("is_summary"):
+                    continue
+                if int(s.get("lf") or 0) == 0 and int(s.get("ef") or 0) > 0:
+                    # ainda não calculado: inicializa
+                    s_dur = int(s.get("duracao") or 0)
+                    s["lf"] = int(s.get("ef") or 0)
+                    s["ls"] = int(s.get("lf") or 0) - s_dur
+                if min_ls is None or int(s.get("ls") or 0) < min_ls:
+                    min_ls = int(s.get("ls") or 0)
             if min_ls is None:
-                min_ls = projeto_fim - dur
+                min_ls = projeto_fim
             t["lf"] = min_ls
             t["ls"] = t["lf"] - dur
 
-        t["slack"] = t["ls"] - t["es"]
+        t["slack"] = int(t.get("ls") or 0) - int(t.get("es") or 0)
+
+    # Resumos: slack/ls/lf derivados (simples)
+    for t in tasks:
+        if t.get("is_summary"):
+            t["ls"] = int(t.get("es") or 0)
+            t["lf"] = int(t.get("ef") or 0)
+            t["slack"] = 0
 
     return tasks, projeto_fim
 
@@ -376,10 +452,11 @@ def gerar_curva_s_trabalho(tasks, data_inicio_str):
         return None
 
     tasks_cpm, total_dias = calcular_cpm(tasks)
+    tasks_leaf = [t for t in tasks_cpm if not t.get('is_summary')]
     if total_dias <= 0:
         return None
 
-    soma_duracoes = sum(int(t.get("duracao") or 0) for t in tasks_cpm)
+    soma_duracoes = sum(int(t.get('duracao') or 0) for t in tasks_leaf)
     if soma_duracoes <= 0:
         return None
 
@@ -388,7 +465,7 @@ def gerar_curva_s_trabalho(tasks, data_inicio_str):
 
     for d in dias:
         acum = 0
-        for t in tasks_cpm:
+        for t in tasks_leaf:
             dur = int(t.get("duracao") or 0)
             es = t.get("es", 0)
             peso = dur / soma_duracoes if soma_duracoes > 0 else 0
@@ -438,7 +515,7 @@ def gerar_gantt(tasks, data_inicio_str):
         es = int(t.get("es", 0))
         ef = int(t.get("ef", 0))
         start = data_inicio_dt + timedelta(days=es)
-        finish = data_inicio_dt + timedelta(days=ef + 1)  # x_end é exclusivo no Plotly
+        finish = data_inicio_dt + timedelta(days=ef)
         rows.append(
             {
                 "Task": f"{t.get('codigo')} - {t.get('descricao')}",
