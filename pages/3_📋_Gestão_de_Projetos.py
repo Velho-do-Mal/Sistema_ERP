@@ -1,44 +1,13 @@
-# -*- coding: utf-8 -*-
 import streamlit as st
 import streamlit.components.v1 as components  # IMPORT CORRETO PARA HTML
 import psycopg2
 import json
 from datetime import datetime, date, timedelta
-import datetime as dt
 import pandas as pd
 import plotly.express as px
 from bk_erp_shared.theme import apply_theme
 from bk_erp_shared.erp_db import ensure_erp_tables
 import bk_finance
-
-def _relation_tooltip():
-    """Ajuda rápida sobre relações de predecessoras (estilo MS Project)."""
-    # Streamlit < 1.30 pode não ter popover. Usa expander como fallback.
-    try:
-        pop = st.popover  # type: ignore[attr-defined]
-    except Exception:
-        pop = None
-
-    if pop:
-        with pop("❓ FS/SS/FF/SF", help="Clique para ver o significado"):
-            st.markdown(
-                """**Tipos de relação entre atividades (MS Project / PMBOK)**
-
-- **FS (Finish-to-Start)**: a sucessora **só inicia quando** a predecessora **termina** (padrão).
-- **SS (Start-to-Start)**: a sucessora **inicia quando** a predecessora **inicia**.
-- **FF (Finish-to-Finish)**: a sucessora **termina quando** a predecessora **termina**.
-- **SF (Start-to-Finish)**: a sucessora **termina quando** a predecessora **inicia** (raro).
-"""
-            )
-    else:
-        with st.expander("❓ FS/SS/FF/SF (ajuda)", expanded=False):
-            st.markdown(
-                """- **FS (Finish-to-Start)**: sucessora inicia após término da predecessora (padrão).
-- **SS (Start-to-Start)**: sucessora inicia junto com início da predecessora.
-- **FF (Finish-to-Finish)**: sucessora termina junto com término da predecessora.
-- **SF (Start-to-Finish)**: sucessora termina quando predecessora inicia (raro).
-"""
-            )
 
 # --------------------------------------------------------
 # CONFIGURAÇÃO BÁSICA / CSS
@@ -304,375 +273,196 @@ def delete_project(project_id: int):
 # CPM / GANTT / CURVA S TRABALHO
 # --------------------------------------------------------
 
-# --------------------------------------------------------
-# EAP / MS Project-like scheduling helpers
-# --------------------------------------------------------
-
-def _to_date(val):
-    """Converte string ISO / datetime / date para date (ou None)."""
-    if val is None or val == "":
-        return None
-    if isinstance(val, date) and not isinstance(val, datetime):
-        return val
-    if isinstance(val, datetime):
-        return val.date()
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return None
-        # aceita YYYY-MM-DD ou YYYY/MM/DD
-        try:
-            if "/" in s:
-                return datetime.strptime(s, "%Y/%m/%d").date()
-            return datetime.strptime(s, "%Y-%m-%d").date()
-        except Exception:
-            # tenta ISO completo
-            try:
-                return datetime.fromisoformat(s).date()
-            except Exception:
-                return None
-    return None
-
-
-def _parse_date(val):
-    """Alias compatível: usa _to_date para converter qualquer datelike em date."""
-    return _to_date(val)
-
-
-
-def _finish_from_start_date(start_date, dur_days):
-    """Término inclusivo: duração=1 => termina no mesmo dia. (MS Project em granularidade de data)"""
-    if start_date is None:
-        return None
-    d = int(dur_days or 0)
-    if d <= 1:
-        return start_date
-    return start_date + timedelta(days=d - 1)
-
-def _iso(d):
-    return d.strftime("%Y-%m-%d") if isinstance(d, date) else ""
-
-def _build_hierarchy(tasks):
-    """
-    Cria relacionamentos pai/filho baseado em 'nivel' e ordem atual.
-    Retorna:
-      - parent_by_id: dict[id] = parent_id ou None
-      - children_by_id: dict[parent_id] = [child_id, ...]
-      - task_by_id: dict[id] = task
-    """
-    task_by_id = {int(t.get("id")): t for t in tasks if t.get("id") is not None}
-    # ordenação estável: mantém a ordem em que está na lista
-    ordered = [task_by_id[int(t["id"])] for t in tasks if t.get("id") is not None]
-    stack = []  # (nivel, id)
-    parent_by_id = {}
-    children_by_id = {}
-    for t in ordered:
-        tid = int(t["id"])
-        lvl = int(t.get("nivel") or 1)
-        while stack and stack[-1][0] >= lvl:
-            stack.pop()
-        parent = stack[-1][1] if stack else None
-        parent_by_id[tid] = parent
-        if parent is not None:
-            children_by_id.setdefault(parent, []).append(tid)
-        stack.append((lvl, tid))
-    return parent_by_id, children_by_id, task_by_id, ordered
-
-def schedule_eap(tasks, project_start=None):
-    """
-    Agenda as tarefas da EAP em DIAS CORRIDOS (como MS Project básico).
-    Regras:
-      - Fim planejado = Início planejado + duração (dias)
-      - Se houver predecessoras, o início é ajustado conforme relação (FS/SS/FF/SF)
-      - Tarefas sumárias (com filhos) assumem início do primeiro filho e fim do último filho
-    Retorna:
-      tasks_out (lista de tarefas com _ps/_pf/_rs/_rf),
-      proj_start (date),
-      proj_end (date)
-    """
-    if not tasks:
-        return [], None, None
-
-    def _finish_from_start(start_date, dur_days):
-        """Retorna a data de término (inclusiva) considerando duração em dias (1 dia => termina no mesmo dia)."""
-        d = int(dur_days or 0)
-        if d <= 1:
-            return start_date
-        return start_date + timedelta(days=d - 1)
-
-    parent_by_id, children_by_id, task_by_id, ordered = _build_hierarchy(tasks)
-
-    # Identifica sumárias
-    is_summary = {tid: (tid in children_by_id and len(children_by_id[tid]) > 0) for tid in task_by_id.keys()}
-
-    # Normaliza predecessors
-    code_to_id = {}
-    for t in ordered:
-        code = str(t.get("codigo") or "").strip()
-        if code:
-            code_to_id[code] = int(t["id"])
-
-    def preds_of(t):
-        preds = t.get("predecessoras") or []
-        if isinstance(preds, str):
-            preds = [x.strip() for x in preds.split(",") if x.strip()]
-        return [p for p in preds if p in code_to_id]
-
-    # Define project_start
-    ps_candidates = []
-    for t in ordered:
-        d = _to_date(t.get("inicio_planejado"))
-        if d:
-            ps_candidates.append(d)
-    if project_start is None:
-        project_start = min(ps_candidates) if ps_candidates else date.today()
-    elif isinstance(project_start, str):
-        project_start = _to_date(project_start) or date.today()
-
-    # Step 1: schedule non-summary tasks (leaves) with dependencies
-    planned = {}  # tid -> (start, finish)
-    unresolved = set([int(t["id"]) for t in ordered if not is_summary[int(t["id"])]])
-
-    # initial manual starts
-    manual_start = {int(t["id"]): (_to_date(t.get("inicio_planejado")) or project_start) for t in ordered}
-
-    def get_rel(t):
-        rel = (t.get("relacao") or t.get("rel") or "FS").strip().upper()
-        return rel if rel in {"FS","SS","FF","SF"} else "FS"
-
-    # iterative resolve
-    changed = True
-    safety = 0
-    while unresolved and changed and safety < 2000:
-        changed = False
-        safety += 1
-        for tid in list(unresolved):
-            t = task_by_id[tid]
-            preds = preds_of(t)
-            # only consider predecessors that are not summary? In MS Project, summary tasks aren't predecessors usually.
-            # We'll allow any scheduled predecessor.
-            if any(code_to_id[p] not in planned and not is_summary.get(code_to_id[p], False) for p in preds):
-                continue  # predecessor leaf not ready
-            # compute constraints based on predecessors (MS Project - date granularity)
-            min_start = project_start
-            min_finish = None
-            dur = max(1, int(t.get('duracao') or 1))
-            for pcode in preds:
-                pid = code_to_id[pcode]
-                # if predecessor is summary, it will be resolved later; skip constraint until we know it
-                if pid not in planned:
-                    continue
-                p_start, p_finish = planned[pid]
-                rel = get_rel(t)
-                if rel == 'FS':
-                    # Successor starts the day AFTER predecessor finishes (date granularity)
-                    min_start = max(min_start, p_finish + timedelta(days=1))
-                elif rel == 'SS':
-                    min_start = max(min_start, p_start)
-                elif rel == 'FF':
-                    min_finish = max(min_finish or p_finish, p_finish)
-                elif rel == 'SF':
-                    min_finish = max(min_finish or p_start, p_start)
-            start = max(manual_start.get(tid, project_start), min_start)
-            if min_finish is not None:
-                start = max(start, min_finish - timedelta(days=dur - 1))
-            finish = _finish_from_start(start, dur)
-            planned[tid] = (start, finish)
-            unresolved.remove(tid)
-            changed = True
-
-    # fallback for cyclic/unresolved: put after project_start by manual
-    for tid in list(unresolved):
-        t = task_by_id[tid]
-        dur = int(t.get("duracao") or 0)
-        start = manual_start.get(tid, project_start)
-        planned[tid] = (start, _finish_from_start(start, max(1, int(dur or 1))))
-        unresolved.remove(tid)
-
-    # Step 2: compute summary tasks from children (bottom-up)
-    # Process tasks by descending level order.
-    ordered_by_level_desc = sorted(ordered, key=lambda x: int(x.get("nivel") or 1), reverse=True)
-    for t in ordered_by_level_desc:
-        tid = int(t["id"])
-        if is_summary.get(tid):
-            child_ids = children_by_id.get(tid, [])
-            child_ranges = [planned.get(cid) for cid in child_ids if cid in planned]
-            # summary may contain other summaries; ensure they are in planned by handling bottom-up
-            # if a child is summary and not in planned yet, it will be computed in this loop earlier because of reverse levels
-            child_ranges = [planned.get(cid) for cid in child_ids if cid in planned]
-            if child_ranges:
-                s = min(r[0] for r in child_ranges)
-                f = max(r[1] for r in child_ranges)
-            else:
-                # no children scheduled: fall back to manual + dur
-                dur = int(t.get("duracao") or 0)
-                s = manual_start.get(tid, project_start)
-                f = _finish_from_start(s, max(1, int(dur or 1)))
-            planned[tid] = (s, f)
-
-    # Step 3: attach computed fields and real dates
-    tasks_out = []
-    for t in ordered:
-        tid = int(t["id"])
-        fallback_start = manual_start.get(tid, project_start)
-        fallback_finish = _finish_from_start(fallback_start, max(1, int(t.get('duracao') or 1)))
-        ps, pf = planned.get(tid, (fallback_start, fallback_finish))
-        out = dict(t)
-        out["_ps"] = ps
-        out["_pf"] = pf
-        # Real
-        rs = _to_date(t.get("inicio_real"))
-        rf = _to_date(t.get("fim_real"))
-        out["_rs"] = rs
-        out["_rf"] = rf
-        tasks_out.append(out)
-
-    proj_start = min(t["_ps"] for t in tasks_out if t.get("_ps")) if tasks_out else project_start
-    proj_end = max(t["_pf"] for t in tasks_out if t.get("_pf")) if tasks_out else project_start
-
-    return tasks_out, proj_start, proj_end
-
-
 def calcular_cpm(tasks):
-    """
-    Mantido por compatibilidade com versões anteriores.
-    Agora apenas devolve as tarefas com ES/EF calculados (dias) a partir do cronograma planejado.
-    """
     if not tasks:
         return tasks, 0
-    # Reusa o agendamento por datas e converte para offsets (dias desde início do projeto)
-    tasks_sched, proj_start, proj_end = schedule_eap(tasks)
-    if not proj_start or not proj_end:
-        return tasks, 0
 
-    for t in tasks_sched:
-        ps = t.get("_ps")
-        pf = t.get("_pf")
-        if ps and pf:
-            t["es"] = int((ps - proj_start).days)
-            t["ef"] = int((pf - proj_start).days)
-        else:
-            t["es"] = 0
-            t["ef"] = int(t.get("duracao") or 0)
+    tasks = [dict(t) for t in tasks]
+    mapa = {t["codigo"]: t for t in tasks}
 
-    projeto_fim = int((proj_end - proj_start).days) if proj_start and proj_end else 0
-    return tasks_sched, projeto_fim
+    for t in tasks:
+        t["es"] = 0
+        t["ef"] = 0
+        t["ls"] = 0
+        t["lf"] = 0
+        t["slack"] = 0
 
-def gerar_curva_s_trabalho(eap_tasks, project_start_str=None):
-    """
-    Curva S (Planejado x Real) baseada na EAP.
-    Planejado: distribuição linear do "trabalho" (peso = duração) entre _ps e _pf.
-    Real: distribuição linear entre _rs e _rf (quando preenchidos).
-    """
-    try:
-        import plotly.graph_objects as go
-    except Exception:
-        return None
+    max_iter = 1000
+    for _ in range(max_iter):
+        atualizado = False
+        for t in tasks:
+            dur = int(t.get("duracao") or 0)
+            preds = t.get("predecessoras") or []
+            rel = t.get("relacao") or "FS"
 
-    tasks_sched, proj_start, proj_end = schedule_eap(eap_tasks, project_start=project_start_str)
-    if not tasks_sched or not proj_start or not proj_end:
-        return None
+            if preds:
+                max_start = 0
+                todos_ok = True
+                for cod in preds:
+                    p = mapa.get(cod)
+                    if not p:
+                        todos_ok = False
+                        break
+                    # MS Project (datas em dias corridos):
+                    # - FS: sucessora inicia no dia seguinte ao término da predecessora
+                    # - SS: sucessora pode iniciar no mesmo dia do início da predecessora
+                    # - FF: término da sucessora acompanha o término da predecessora
+                    # - SF: término da sucessora acompanha o início da predecessora
+                    if rel == "FS":
+                        cand = int(p.get("ef", 0)) + 1
+                    elif rel == "SS":
+                        cand = int(p.get("es", 0))
+                    elif rel == "FF":
+                        cand = int(p.get("ef", 0)) - dur + 1
+                    elif rel == "SF":
+                        cand = int(p.get("es", 0)) - dur + 1
+                    else:
+                        cand = int(p.get("ef", 0)) + 1
+                    if cand < 0:
+                        cand = 0
+                    if cand > max_start:
+                        max_start = cand
+                if not todos_ok:
+                    continue
+                if t["ef"] == 0:
+                    t["es"] = max_start
+                    t["ef"] = t["es"] + max(dur,1) - 1
+                    atualizado = True
+            else:
+                if t["ef"] == 0:
+                    t["es"] = 0
+                    t["ef"] = max(dur,1) - 1
+                    atualizado = True
+        if not atualizado:
+            break
 
-    # define horizonte (até o maior entre planejado e real)
-    real_ends = [t.get("_rf") for t in tasks_sched if t.get("_rf")]
-    horizon_end = max([proj_end] + real_ends) if real_ends else proj_end
+    projeto_fim = max((t["ef"] for t in tasks), default=0)
 
-    days = (horizon_end - proj_start).days
-    if days <= 0:
-        return None
+    succ_map = {t["codigo"]: [] for t in tasks}
+    for t in tasks:
+        for cod_p in (t.get("predecessoras") or []):
+            if cod_p in succ_map:
+                succ_map[cod_p].append(t["codigo"])
 
-    planned_daily = [0.0] * (days + 1)
-    real_daily = [0.0] * (days + 1)
-
-    for t in tasks_sched:
+    ordem = sorted(tasks, key=lambda x: x["es"], reverse=True)
+    for t in ordem:
+        cod = t["codigo"]
         dur = int(t.get("duracao") or 0)
-        if dur <= 0:
-            continue
-        # planned
-        ps, pf = t.get("_ps"), t.get("_pf")
-        if ps and pf:
-            start_idx = max(0, (ps - proj_start).days)
-            end_idx = min(days, (pf - proj_start).days)
-            span = max(1, end_idx - start_idx)
-            w = float(dur)
-            for i in range(start_idx, end_idx):
-                planned_daily[i] += w / span
-        # real
-        rs, rf = t.get("_rs"), t.get("_rf")
-        if rs and rf:
-            start_idx = max(0, (rs - proj_start).days)
-            end_idx = min(days, (rf - proj_start).days)
-            span = max(1, end_idx - start_idx)
-            w = float(dur)
-            for i in range(start_idx, end_idx):
-                real_daily[i] += w / span
+        succs = succ_map.get(cod) or []
+        if not succs:
+            t["lf"] = projeto_fim
+            t["ls"] = projeto_fim - (max(dur,1) - 1)
+        else:
+            min_ls = None
+            for scod in succs:
+                s = mapa[scod]
+                if s["lf"] == 0:
+                    s["lf"] = s["ef"]
+                    s["ls"] = s["lf"] - int(s.get("duracao") or 0)
+                if (min_ls is None) or (s["ls"] < min_ls):
+                    min_ls = s["ls"]
+            if min_ls is None:
+                min_ls = projeto_fim - dur
+            t["lf"] = min_ls
+            t["ls"] = t["lf"] - dur
 
-    # cumulative
-    planned_cum = []
-    real_cum = []
-    p = 0.0
-    r = 0.0
-    for i in range(days + 1):
-        p += planned_daily[i]
-        r += real_daily[i]
-        planned_cum.append(p)
-        real_cum.append(r)
+        t["slack"] = t["ls"] - t["es"]
 
-    x = [proj_start + timedelta(days=i) for i in range(days + 1)]
+    return tasks, projeto_fim
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=planned_cum, mode="lines", name="Planejado"))
-    fig.add_trace(go.Scatter(x=x, y=real_cum, mode="lines", name="Real"))
+
+def gerar_curva_s_trabalho(tasks, data_inicio_str):
+    if not tasks or not data_inicio_str:
+        return None
+
+    tasks_cpm, total_dias = calcular_cpm(tasks)
+    if total_dias <= 0:
+        return None
+
+    soma_duracoes = sum(int(t.get("duracao") or 0) for t in tasks_cpm)
+    if soma_duracoes <= 0:
+        return None
+
+    dias = list(range(0, total_dias + 1))
+    progresso = []
+
+    for d in dias:
+        acum = 0
+        for t in tasks_cpm:
+            dur = int(t.get("duracao") or 0)
+            es = t.get("es", 0)
+            peso = dur / soma_duracoes if soma_duracoes > 0 else 0
+            if d <= es:
+                frac = 0
+            elif d >= es + dur:
+                frac = 1
+            else:
+                frac = (d - es) / dur
+            acum += peso * frac
+        progresso.append(acum * 100.0)
+
+    df = pd.DataFrame(
+        {
+            "Dia do Projeto": dias,
+            "Progresso (%)": progresso,
+        }
+    )
+    fig = px.line(
+        df,
+        x="Dia do Projeto",
+        y="Progresso (%)",
+        title=f"Curva S de Trabalho (a partir de {data_inicio_str})",
+    )
+    fig.update_traces(mode="lines+markers")
     fig.update_layout(
-        title="Curva S (Planejado x Real)",
-        xaxis_title="Data",
-        yaxis_title="Trabalho acumulado (peso = duração)",
-        hovermode="x unified",
-        height=420,
-        margin=dict(l=10, r=10, t=40, b=10),
+        template="plotly_dark",
+        height=350,
+        margin=dict(l=30, r=20, t=35, b=30),
     )
     return fig
 
 
-def gerar_gantt(eap_tasks, project_start_str=None):
+def gerar_gantt(tasks, data_inicio_str):
     """
-    Gantt com barras sobrepostas: Planejado x Real.
+    Gera um gráfico de Gantt simplificado a partir das tarefas (usa es/ef gerados pelo CPM).
     """
+    if not tasks or not data_inicio_str:
+        return None
+    tasks_cpm, projeto_fim = calcular_cpm(tasks)
     try:
-        import plotly.express as _px
+        data_inicio_dt = datetime.strptime(data_inicio_str, "%Y-%m-%d").date()
     except Exception:
         return None
-
-    tasks_sched, proj_start, proj_end = schedule_eap(eap_tasks, project_start=project_start_str)
-    if not tasks_sched:
-        return None
-
     rows = []
-    for t in tasks_sched:
-        code = str(t.get("codigo") or "")
-        desc = str(t.get("descricao") or "")
-        label = f"{code} - {desc}" if code else desc
-        ps, pf = t.get("_ps"), t.get("_pf")
-        if ps and pf:
-            rows.append({"Tarefa": label, "Inicio": ps, "Fim": pf, "Tipo": "Planejado"})
-        rs, rf = t.get("_rs"), t.get("_rf")
-        if rs and rf:
-            rows.append({"Tarefa": label, "Inicio": rs, "Fim": rf, "Tipo": "Real"})
-
+    for t in tasks_cpm:
+        es = int(t.get("es", 0))
+        ef = int(t.get("ef", 0))
+        start = data_inicio_dt + timedelta(days=es)
+        finish = data_inicio_dt + timedelta(days=ef + 1)  # x_end é exclusivo no Plotly
+        rows.append(
+            {
+                "Task": f"{t.get('codigo')} - {t.get('descricao')}",
+                "Start": start,
+                "Finish": finish,
+                "Resource": t.get("responsavel", ""),
+            }
+        )
     if not rows:
         return None
-
-    df = pd.DataFrame(rows)
-    fig = _px.timeline(df, x_start="Inicio", x_end="Fim", y="Tarefa", color="Tipo")
+    dfg = pd.DataFrame(rows)
+    fig = px.timeline(dfg, x_start="Start", x_end="Finish", y="Task", color="Resource")
     fig.update_yaxes(autorange="reversed")
     fig.update_layout(
-        title="Gantt (Planejado x Real)",
-        barmode="overlay",
-        height=max(450, 26 * df["Tarefa"].nunique()),
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend_title_text="",
+        template="plotly_dark",
+        height=350,
+        margin=dict(l=30, r=20, t=35, b=30),
     )
     return fig
+
+
+# --------------------------------------------------------
+# FINANCEIRO / CURVA S FINANCEIRA
+# --------------------------------------------------------
 
 def adicionar_dias(dt: date, qtd: int) -> date:
     return dt + timedelta(days=qtd)
@@ -1088,7 +878,7 @@ with tabs[0]:
         alt = tap.get("alteracoesEscopo") or []
         if alt:
             df_alt = pd.DataFrame(alt)
-            st.dataframe(df_alt.tail(5), width='stretch', height=160)
+            st.dataframe(df_alt.tail(5), use_container_width=True, height=160)
         else:
             st.caption("Nenhuma alteração registrada.")
     with col_r:
@@ -1097,7 +887,7 @@ with tabs[0]:
             df_r = pd.DataFrame(risks)
             st.dataframe(
                 df_r[["descricao", "impacto", "prob", "indice"]].tail(5),
-                width='stretch',
+                use_container_width=True,
                 height=160,
             )
         else:
@@ -1189,7 +979,7 @@ with tabs[1]:
         alt = tap.get("alteracoesEscopo") or []
         if alt:
             df_alt = pd.DataFrame(alt)
-            st.dataframe(df_alt, width='stretch', height=180)
+            st.dataframe(df_alt, use_container_width=True, height=180)
 
             idx_alt = st.selectbox(
                 "Selecione uma alteração para editar / excluir",
@@ -1232,41 +1022,28 @@ with tabs[2]:
     st.markdown("### 📦 Estrutura Analítica do Projeto (EAP)")
 
     with st.expander("Cadastrar atividade na EAP", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 1, 1])
+        c1, c2, c3, c4 = st.columns([1, 2, 1, 1])
         with c1:
             codigo = st.text_input("Código (1.2.3)", key="eap_codigo")
-        with c2:
             nivel = st.selectbox("Nível", [1, 2, 3, 4], index=0, key="eap_nivel")
-        with c3:
+        with c2:
             descricao = st.text_input("Descrição da atividade", key="eap_descricao")
+        with c3:
+            duracao = st.number_input(
+                "Duração (dias)", min_value=1, value=1, key="eap_dur"
+            )
         with c4:
-            duracao = st.number_input("Duração (dias corridos)", min_value=1, value=1, key="eap_dur")
-        with c5:
             responsavel = st.text_input("Responsável", key="eap_resp")
-
-        st.markdown("**Datas planejadas e reais**")
-        d1, d2, d3, d4 = st.columns([1, 1, 1, 1])
-        with d1:
-            inicio_planejado = st.date_input("Início planejado", value=dt.date.today(), key="eap_inicio_plan")
-        with d2:
-            fim_planejado_prev = inicio_planejado + dt.timedelta(days=int(duracao))
-            st.date_input("Fim planejado (calculado)", value=fim_planejado_prev, disabled=True, key="eap_fim_plan_view")
-        with d3:
-            has_inicio_real = st.checkbox("Definir início real", value=False, key="eap_has_inicio_real")
-            inicio_real = st.date_input("Início real", value=dt.date.today(), key="eap_inicio_real") if has_inicio_real else None
-        with d4:
-            has_fim_real = st.checkbox("Definir fim real", value=False, key="eap_has_fim_real")
-            fim_real = st.date_input("Fim real", value=dt.date.today(), key="eap_fim_real") if has_fim_real else None
 
         col_pp, col_rel, col_stat = st.columns([2, 1, 1])
         with col_pp:
-            predecessoras_str = st.text_input("Predecessoras (códigos separados por vírgula)", key="eap_pred")
+            predecessoras_str = st.text_input(
+                "Predecessoras (códigos separados por vírgula)", key="eap_pred"
+            )
         with col_rel:
-            try:
-                _relation_tooltip()
-            except Exception:
-                pass
-            relacao = st.selectbox("Relação", ["FS", "FF", "SS", "SF"], index=0, key="eap_rel")
+            relacao = st.selectbox(
+                "Relação", ["FS", "FF", "SS", "SF"], index=0, key="eap_rel"
+            )
         with col_stat:
             status = st.selectbox(
                 "Status",
@@ -1291,9 +1068,6 @@ with tabs[2]:
                         "duracao": int(duracao),
                         "relacao": relacao,
                         "status": status,
-                        "inicio_planejado": inicio_planejado.strftime("%Y-%m-%d"),
-                        "inicio_real": inicio_real.strftime("%Y-%m-%d") if inicio_real else "",
-                        "fim_real": fim_real.strftime("%Y-%m-%d") if fim_real else "",
                     }
                 )
                 salvar_estado()
@@ -1304,16 +1078,7 @@ with tabs[2]:
         st.markdown("#### Tabela de atividades da EAP")
 
         # Indentação conforme nível (1..4) - usando NBSP para preservar espaços
-
-        tasks_sched, _proj_start, _proj_end = schedule_eap(eapTasks)
-        for _t in tasks_sched:
-            _t["inicio_previsto"] = _iso(_t.get("_ps"))
-            _t["fim_previsto"] = _iso(_t.get("_pf"))
-            # mantém as strings salvas (se existirem)
-            _t["inicio_planejado"] = _t.get("inicio_planejado") or ""
-            _t["inicio_real"] = _t.get("inicio_real") or ""
-            _t["fim_real"] = _t.get("fim_real") or ""
-        df_eap = pd.DataFrame(tasks_sched)
+        df_eap = pd.DataFrame(eapTasks)
         df_eap_sorted = df_eap.sort_values(by="codigo")
         df_eap_display = df_eap_sorted.copy()
         def indent_desc(row):
@@ -1321,262 +1086,11 @@ with tabs[2]:
             return ("\u00A0" * 4 * (niv - 1)) + str(row.get("descricao", ""))
         df_eap_display["descricao"] = df_eap_display.apply(indent_desc, axis=1)
         # Exibe a tabela com a descrição indentada
-        st.caption("Edite direto na tabela (estilo Excel). Observação: se a atividade tiver predecessora, o início planejado é recalculado automaticamente conforme a relação (FS/SS/FF/SF) ao salvar.")
-
-        # Tabela editável (PowerApps/Excel) — tenta AgGrid; se não existir, usa st.data_editor
-        df_edit = df_eap_sorted[[
-            "id","codigo","nivel","descricao","duracao","responsavel","predecessoras","relacao","status",
-            "inicio_planejado","inicio_real","fim_real","inicio_previsto","fim_previsto"
-        ]].copy()
-        df_edit["predecessoras"] = df_edit["predecessoras"].apply(
-            lambda v: ", ".join(v) if isinstance(v, list) else (str(v) if v not in (None, "") else "")
-        )
-        df_edit["inicio_planejado"] = df_edit["inicio_planejado"].apply(lambda v: _iso(_to_date(v)) if v else "")
-        df_edit["inicio_real"] = df_edit["inicio_real"].apply(lambda v: _iso(_to_date(v)) if v else "")
-        df_edit["fim_real"] = df_edit["fim_real"].apply(lambda v: _iso(_to_date(v)) if v else "")
-        df_edit["Excluir"] = False
-
-        use_aggrid = False
         try:
-            from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-            use_aggrid = True
+            st.dataframe(df_eap_display.drop(columns=["id"]), use_container_width=True, height=260)
         except Exception:
-            use_aggrid = False
+            st.dataframe(df_eap_display, use_container_width=True, height=260)
 
-        edited_df = None
-        selected_rows = []
-        if use_aggrid:
-            gb = GridOptionsBuilder.from_dataframe(df_edit)
-            gb.configure_default_column(editable=True, resizable=True, filter=True)
-            gb.configure_selection("multiple", use_checkbox=True)
-            gb.configure_column("id", header_name="ID", editable=False, width=80)
-            gb.configure_column("codigo", header_name="Código", width=110)
-            gb.configure_column("nivel", header_name="Nível", width=90)
-            gb.configure_column("duracao", header_name="Duração (dias)", width=140)
-            gb.configure_column("inicio_previsto", header_name="Início (calc)", editable=False, width=140)
-            gb.configure_column("fim_previsto", header_name="Fim (calc)", editable=False, width=140)
-            gb.configure_column("Excluir", header_name="Excluir", editable=True, width=90)
-            grid = AgGrid(
-                df_edit,
-                gridOptions=gb.build(),
-                update_mode=GridUpdateMode.MODEL_CHANGED,
-                data_return_mode=DataReturnMode.AS_INPUT,
-                fit_columns_on_grid_load=True,
-                height=320,
-                key="eap_grid",
-            )
-            edited_df = pd.DataFrame(grid["data"])
-            selected_rows = grid.get("selected_rows") or []
-        else:
-            col_cfg = {
-                "id": st.column_config.NumberColumn("ID", disabled=True),
-                "codigo": st.column_config.TextColumn("Código", required=True),
-                "nivel": st.column_config.SelectboxColumn("Nível", options=[1,2,3,4], required=True),
-                "descricao": st.column_config.TextColumn("Descrição", required=True),
-                "duracao": st.column_config.NumberColumn("Duração (dias corridos)", min_value=0, step=1, required=True),
-                "responsavel": st.column_config.TextColumn("Responsável"),
-                "predecessoras": st.column_config.TextColumn("Predecessoras (códigos, vírgula)"),
-                "relacao": st.column_config.SelectboxColumn("Relação", options=["FS","SS","FF","SF"], required=True),
-                "status": st.column_config.SelectboxColumn(
-                    "Status", options=["nao-iniciado","em-andamento","em-analise","em-revisao","concluido"], required=True
-                ),
-                "inicio_planejado": st.column_config.TextColumn("Início planejado (YYYY-MM-DD)"),
-                "inicio_real": st.column_config.TextColumn("Início real (YYYY-MM-DD)"),
-                "fim_real": st.column_config.TextColumn("Fim real (YYYY-MM-DD)"),
-                "inicio_previsto": st.column_config.TextColumn("Início (calc)", disabled=True),
-                "fim_previsto": st.column_config.TextColumn("Fim (calc)", disabled=True),
-                "Excluir": st.column_config.CheckboxColumn("Excluir", default=False),
-            }
-            edited_df = st.data_editor(
-                df_edit.drop(columns=["descricao"]).assign(descricao=df_edit["descricao"]),  # garante ordem
-                column_config=col_cfg,
-                disabled=["inicio_previsto","fim_previsto"],
-                num_rows="dynamic",
-                width='stretch',
-                hide_index=True,
-                key="eap_editor_table",
-            )
-
-        # Botão de exclusão rápida (selecionados no AgGrid)
-        if selected_rows and st.button("🗑️ Excluir selecionados", type="secondary", width='stretch'):
-            sel_ids = {int(r["id"]) for r in selected_rows if r.get("id") is not None}
-            before = len(eapTasks)
-            eapTasks[:] = [t for t in eapTasks if int(t.get("id")) not in sel_ids]
-            salvar_estado()
-            st.success(f"Excluídas {before - len(eapTasks)} atividades.")
-            st.rerun()
-
-        if st.button("💾 Salvar alterações da EAP", type="primary", width='stretch'):
-            df_upd = pd.DataFrame(edited_df)
-            if df_upd.empty:
-                st.warning("Tabela vazia.")
-            else:
-                # Aplica exclusões (checkbox)
-                del_ids = set(df_upd.loc[df_upd["Excluir"] == True, "id"].dropna().astype(int).tolist()) if "Excluir" in df_upd.columns else set()
-                if del_ids:
-                    eapTasks[:] = [t for t in eapTasks if int(t.get("id")) not in del_ids]
-
-                # Atualiza / insere
-                by_id = {int(t.get("id")): t for t in eapTasks if t.get("id") is not None}
-                for _, r in df_upd.iterrows():
-                    rid = r.get("id")
-                    if rid is None or (isinstance(rid, float) and pd.isna(rid)):
-                        # nova linha
-                        rid = int(datetime.now().timestamp() * 1000)
-                        task = {"id": rid}
-                        eapTasks.append(task)
-                        by_id[int(rid)] = task
-                    else:
-                        rid = int(rid)
-                        task = by_id.get(rid)
-                        if task is None:
-                            task = {"id": rid}
-                            eapTasks.append(task)
-                            by_id[rid] = task
-
-                    if bool(r.get("Excluir", False)):
-                        continue
-
-                    task["codigo"] = str(r.get("codigo", "") or "").strip()
-                    task["nivel"] = int(r.get("nivel") or 1)
-                    task["descricao"] = str(r.get("descricao", "") or "").strip()
-                    task["duracao"] = int(r.get("duracao") or 0)
-                    task["responsavel"] = str(r.get("responsavel", "") or "").strip()
-                    preds_str = str(r.get("predecessoras", "") or "")
-                    task["predecessoras"] = [x.strip() for x in preds_str.split(",") if x.strip()]
-                    rel = str(r.get("relacao", "FS") or "FS").strip().upper()
-                    task["relacao"] = rel if rel in {"FS","SS","FF","SF"} else "FS"
-                    stt = str(r.get("status", "nao-iniciado") or "nao-iniciado").strip()
-                    task["status"] = stt
-
-                    # datas (strings)
-                    task["inicio_planejado"] = str(r.get("inicio_planejado", "") or "").strip()
-                    task["inicio_real"] = str(r.get("inicio_real", "") or "").strip()
-                    task["fim_real"] = str(r.get("fim_real", "") or "").strip()
-
-                # Recalcula cronograma (MS Project básico) e persiste início planejado calculado + duração sumária
-                tasks_sched, _ps, _pf = schedule_eap(eapTasks, project_start=tap.get("dataInicio"))
-                parent_by_id, children_by_id, task_by_id, ordered = _build_hierarchy(eapTasks)
-                sched_by_id = {int(t["id"]): t for t in tasks_sched if t.get("id") is not None}
-
-                for t in eapTasks:
-                    tid = int(t.get("id"))
-                    s = sched_by_id.get(tid)
-                    if s and s.get("_ps"):
-                        t["inicio_planejado"] = _iso(s.get("_ps"))
-
-                # atualiza duração das sumárias pelo intervalo calculado
-                for pid, childs in children_by_id.items():
-                    if childs:
-                        s = sched_by_id.get(int(pid))
-                        if s and s.get("_ps") and s.get("_pf"):
-                            task_by_id[int(pid)]["duracao"] = int((s["_pf"] - s["_ps"]).days)
-
-                salvar_estado()
-                st.success("EAP atualizada e cronograma recalculado.")
-                st.rerun()
-
-        with st.expander("📄 Relatório EAP (Status)", expanded=False):
-
-            # Logos (opcional) para deixar o relatório no padrão BK
-            l1, l2 = st.columns(2)
-            with l1:
-                bk_logo_file = st.file_uploader("Logo BK (opcional)", type=["png", "jpg", "jpeg", "svg"], key="eap_logo_bk_file")
-            with l2:
-                cliente_logo_file = st.file_uploader("Logo do cliente (opcional)", type=["png", "jpg", "jpeg", "svg"], key="eap_logo_cliente_file")
-
-            def _file_to_data_uri(_f):
-                if not _f:
-                    return ""
-                import base64
-                data = _f.getvalue()
-                name = (_f.name or "").lower()
-                if name.endswith(".svg"):
-                    mime = "image/svg+xml"
-                elif name.endswith(".jpg") or name.endswith(".jpeg"):
-                    mime = "image/jpeg"
-                else:
-                    mime = "image/png"
-                return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
-
-            bk_logo_uri = _file_to_data_uri(bk_logo_file)
-            cliente_logo_uri = _file_to_data_uri(cliente_logo_file)
-            cols = ["codigo", "descricao", "nivel", "inicio_previsto", "fim_previsto", "duracao", "status", "responsavel"]
-            df_rel = df_eap_sorted.copy()
-            # garante colunas
-            for c in cols:
-                if c not in df_rel.columns:
-                    df_rel[c] = ""
-            df_rel = df_rel[cols].sort_values(by="codigo")
-            st.dataframe(df_rel, width='stretch', height=320)
-            csv = df_rel.to_csv(index=False).encode("utf-8")
-            st.download_button("Baixar CSV", data=csv, file_name="relatorio_eap_status.csv", mime="text/csv")
-
-            # --- Gráficos no relatório (Planejado x Real)
-            st.markdown("##### Curva S e Gantt (Planejado x Real)")
-            fig_s = gerar_curva_s_trabalho(eapTasks, tap.get("dataInicio"))
-            if fig_s:
-                st.plotly_chart(fig_s, width='stretch', key="curva_s_relatorio")
-            fig_g = gerar_gantt(eapTasks, tap.get("dataInicio"))
-            if fig_g:
-                st.plotly_chart(fig_g, width='stretch', key="gantt_relatorio")
-
-            # --- Export HTML (tabela + gráficos)
-
-            try:
-                import plotly.io as pio
-                from datetime import datetime as _dt
-
-                generated_at = _dt.now().strftime("%d/%m/%Y %H:%M")
-                proj_nome = str(tap.get("nome") or tap.get("nomeProjeto") or tap.get("projeto") or "")
-                proj_code = str(tap.get("cod_projeto") or tap.get("codigo") or tap.get("codProjeto") or "")
-                cliente_nome = str(tap.get("cliente") or tap.get("clienteNome") or tap.get("client_name") or "")
-
-                css = """<style>
-                body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;margin:24px}
-                .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-                .brand{flex:1;text-align:center}
-                .brand h1{margin:0;font-size:22px;letter-spacing:.2px}
-                .meta{font-size:12px;color:#334155;margin-top:6px}
-                .logo{width:130px;height:60px;object-fit:contain}
-                .divider{height:1px;background:#e2e8f0;margin:12px 0}
-                h2{font-size:16px;margin:16px 0 8px}
-                .tbl{border-collapse:collapse;width:100%;font-size:12px}
-                .tbl th,.tbl td{border:1px solid #d1d5db;padding:6px 8px;vertical-align:top}
-                .tbl th{background:#f1f5f9;text-align:left}
-                .muted{color:#64748b}
-                </style>"""
-
-                table_html = df_rel.to_html(index=False, classes="tbl", border=0)
-
-                bk_logo_tag = f'<img class="logo" src="{bk_logo_uri}" />' if bk_logo_uri else ''
-                cli_logo_tag = f'<img class="logo" src="{cliente_logo_uri}" />' if cliente_logo_uri else ''
-
-                html_parts = []
-                html_parts.append("<!doctype html><html><head><meta charset='utf-8'>" + css + "</head><body>")
-                html_parts.append("<div class='header'>" + bk_logo_tag + "<div class='brand'>"
-                                  "<h1>BK Engenharia e Tecnologia</h1>"
-                                  f"<div class='meta'>Gerado em: {generated_at}</div>"
-                                  "</div>" + cli_logo_tag + "</div>")
-                html_parts.append("<div class='meta'><b>Cliente:</b> " + (cliente_nome or "-") +
-                                  " &nbsp;&nbsp; <b>Projeto:</b> " + (proj_nome or "-") +
-                                  (f" &nbsp;&nbsp; <b>Código:</b> {proj_code}" if proj_code else "") + "</div>")
-                html_parts.append("<div class='divider'></div>")
-                html_parts.append("<h2>EAP e Status</h2>")
-                html_parts.append(table_html)
-
-                if fig_s:
-                    html_parts.append("<h2>Curva S (Planejado x Real)</h2>")
-                    html_parts.append(pio.to_html(fig_s, include_plotlyjs='cdn', full_html=False))
-                if fig_g:
-                    html_parts.append("<h2>Gantt (Planejado x Real)</h2>")
-                    html_parts.append(pio.to_html(fig_g, include_plotlyjs=False, full_html=False))
-
-                html_parts.append("</body></html>")
-                html = "\n".join(html_parts).encode("utf-8")
-                st.download_button("Baixar Relatório HTML", data=html, file_name="relatorio_eap_status.html", mime="text/html")
-            except Exception:
-                pass
         idx_eap = st.selectbox(
             "Selecione a atividade para editar / excluir",
             options=list(range(len(df_eap_sorted))),
@@ -1587,34 +1101,6 @@ with tabs[2]:
         id_sel = int(df_eap_sorted.iloc[idx_eap]["id"])
         tarefa_sel = next((t for t in eapTasks if t.get("id") == id_sel), None)
 
-
-        # Streamlit mantém valores em session_state quando os widgets têm key fixa.
-        # Ao trocar a atividade selecionada, precisamos atualizar os valores padrão do formulário de edição.
-        if tarefa_sel is None:
-            st.warning('Atividade não encontrada para edição.')
-            st.stop()
-        if st.session_state.get('eap_edit_current_id') != id_sel:
-            st.session_state['eap_edit_current_id'] = id_sel
-            st.session_state['eap_edit_codigo'] = str(tarefa_sel.get('codigo') or '')
-            st.session_state['eap_edit_nivel'] = int(tarefa_sel.get('nivel') or 1)
-            st.session_state['eap_edit_desc'] = str(tarefa_sel.get('descricao') or '')
-            st.session_state['eap_edit_dur'] = int(tarefa_sel.get('duracao') or 1)
-            st.session_state['eap_edit_resp'] = str(tarefa_sel.get('responsavel') or '')
-            st.session_state['eap_edit_pred'] = str(tarefa_sel.get('predecessoras') or '')
-            st.session_state['eap_edit_rel'] = str(tarefa_sel.get('relacao') or 'FS')
-            st.session_state['eap_edit_status'] = str(tarefa_sel.get('status') or '')
-            ip = _to_date(tarefa_sel.get('inicio_planejado')) or dt.date.today()
-            st.session_state['eap_edit_inicio_plan'] = ip
-            st.session_state['eap_edit_fim_plan_view'] = _finish_from_start_date(ip, int(tarefa_sel.get('duracao') or 1))
-            rs = _to_date(tarefa_sel.get('inicio_real'))
-            rf = _to_date(tarefa_sel.get('fim_real'))
-            st.session_state['eap_edit_has_inicio_real'] = bool(rs)
-            st.session_state['eap_edit_inicio_real'] = rs or ip
-            st.session_state['eap_edit_has_fim_real'] = bool(rf)
-            st.session_state['eap_edit_fim_real'] = rf or _finish_from_start_date(ip, int(tarefa_sel.get('duracao') or 1))
-
-
-        
         # --------- EDIÇÃO DE ATIVIDADE DA EAP ---------
         if tarefa_sel:
             st.markdown("#### Editar atividade selecionada")
@@ -1650,23 +1136,6 @@ with tabs[2]:
                     value=tarefa_sel.get("responsavel", ""),
                     key="eap_edit_resp"
                 )
-
-            st.markdown("**Datas planejadas e reais (edição)**")
-            ed1, ed2, ed3, ed4 = st.columns([1, 1, 1, 1])
-            with ed1:
-                inicio_plan_default = _parse_date(tarefa_sel.get("inicio_planejado")) or dt.date.today()
-                inicio_planejado_edit = st.date_input("Início planejado (edição)", value=inicio_plan_default, key="eap_edit_inicio_plan")
-            with ed2:
-                fim_plan_calc = _finish_from_start_date(inicio_planejado_edit, int(dur_edit or 1))
-                st.date_input("Fim planejado (calculado)", value=fim_plan_calc, disabled=True, key="eap_edit_fim_plan_view")
-            with ed3:
-                has_inicio_real_e = st.checkbox("Definir início real", value=bool(_parse_date(tarefa_sel.get("inicio_real"))), key="eap_edit_has_inicio_real")
-                inicio_real_default = _parse_date(tarefa_sel.get("inicio_real")) or dt.date.today()
-                inicio_real_edit = st.date_input("Início real", value=inicio_real_default, key="eap_edit_inicio_real") if has_inicio_real_e else None
-            with ed4:
-                has_fim_real_e = st.checkbox("Definir fim real", value=bool(_parse_date(tarefa_sel.get("fim_real"))), key="eap_edit_has_fim_real")
-                fim_real_default = _parse_date(tarefa_sel.get("fim_real")) or dt.date.today()
-                fim_real_edit = st.date_input("Fim real", value=fim_real_default, key="eap_edit_fim_real") if has_fim_real_e else None
 
             ce5, ce6, ce7 = st.columns([2, 1, 1])
             with ce5:
@@ -1710,9 +1179,6 @@ with tabs[2]:
                 ]
                 tarefa_sel["relacao"] = relacao_edit
                 tarefa_sel["status"] = status_edit
-                tarefa_sel["inicio_planejado"] = inicio_planejado_edit.strftime("%Y-%m-%d")
-                tarefa_sel["inicio_real"] = inicio_real_edit.strftime("%Y-%m-%d") if inicio_real_edit else ""
-                tarefa_sel["fim_real"] = fim_real_edit.strftime("%Y-%m-%d") if fim_real_edit else ""
                 salvar_estado()
                 st.success("Atividade atualizada.")
                 st.rerun()
@@ -1731,68 +1197,16 @@ with tabs[2]:
         if tap.get("dataInicio"):
             fig_s = gerar_curva_s_trabalho(eapTasks, tap["dataInicio"])
             if fig_s:
-                st.plotly_chart(fig_s, width='stretch', key="curva_s_trabalho_main")
+                st.plotly_chart(fig_s, use_container_width=True, key="curva_s_trabalho_main")
             else:
                 st.warning("Não foi possível gerar a Curva S de trabalho.")
             # --- Gantt abaixo da Curva S (solicitado)
             fig_gantt = gerar_gantt(eapTasks, tap["dataInicio"])
             if fig_gantt:
                 st.markdown("#### Gráfico de Gantt (cronograma simplificado)")
-                st.plotly_chart(fig_gantt, width='stretch', key="gantt_main")
+                st.plotly_chart(fig_gantt, use_container_width=True, key="gantt_main")
             else:
                 st.caption("Gantt indisponível - verifique dados da EAP e data de início.")
-            # ---- Indicadores rápidos (Prazo e Custo) ----
-            try:
-                tasks_sched, proj_start_dt, proj_end_dt = schedule_eap(eapTasks, project_start=tap.get("dataInicio"))
-                if proj_end_dt:
-                    today = date.today()
-                    # conclusão real (se existir)
-                    real_ends = [_to_date(t.get("fim_real")) for t in eapTasks if _to_date(t.get("fim_real"))]
-                    actual_end_dt = max(real_ends) if real_ends else None
-
-                    # considera "concluído" quando todas as atividades folha estão concluídas
-                    parent_by_id, children_by_id, task_by_id, ordered = _build_hierarchy(eapTasks)
-                    summary_ids = set(children_by_id.keys())
-                    leaf_tasks = [t for t in ordered if int(t.get("id")) not in summary_ids]
-                    done_leaf = [t for t in leaf_tasks if str(t.get("status")) == "concluido" or _to_date(t.get("fim_real"))]
-                    all_done = (len(leaf_tasks) > 0 and len(done_leaf) == len(leaf_tasks))
-
-                    ref_end = actual_end_dt if all_done and actual_end_dt else today
-                    atraso_dias = (ref_end - proj_end_dt).days
-                    situacao = "No prazo" if atraso_dias <= 0 else "Atrasado"
-                    cA, cB, cC = st.columns(3)
-                    with cA:
-                        st.metric("Término planejado", proj_end_dt.strftime("%Y-%m-%d"))
-                    with cB:
-                        st.metric("Término real/atual", ref_end.strftime("%Y-%m-%d"))
-                    with cC:
-                        st.metric("Situação (prazo)", situacao, delta=f"{atraso_dias} dias")
-
-                # custo (planejado x realizado) com base nos lançamentos financeiros
-                despesas_prev = 0.0
-                despesas_real = 0.0
-                for l in finances or []:
-                    try:
-                        tipo = str(l.get("tipo") or "").lower()
-                        valor = float(l.get("valor") or 0)
-                        if "desp" in tipo or "custo" in tipo or "saída" in tipo or "saida" in tipo:
-                            despesas_prev += valor
-                            if l.get("realizado") and l.get("dataRealizada"):
-                                despesas_real += valor
-                    except Exception:
-                        pass
-                if despesas_prev > 0:
-                    delta = despesas_real - despesas_prev
-                    situ = "Abaixo do previsto" if delta <= 0 else "Acima do previsto"
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.metric("Custos planejados", f"R$ {despesas_prev:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-                    with c2:
-                        st.metric("Custos realizados", f"R$ {despesas_real:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-                    with c3:
-                        st.metric("Situação (custo)", situ, delta=f"R$ {delta:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-            except Exception:
-                pass
         else:
             st.warning("Defina a data de início no TAP para gerar a Curva S de trabalho.")
     else:
@@ -1957,7 +1371,7 @@ with tabs[3]:
             "Parcela",
         ]
         st.dataframe(
-            df_fin_display[cols_show], width='stretch', height=260
+            df_fin_display[cols_show], use_container_width=True, height=260
         )
 
         idx_fin = st.selectbox(
@@ -2135,7 +1549,7 @@ with tabs[3]:
             )
             if fig_fluxo:
                 # <-- chave única adicionada para evitar StreamlitDuplicateElementId
-                st.plotly_chart(fig_fluxo, width='stretch', key="curva_s_financeira_tab")
+                st.plotly_chart(fig_fluxo, use_container_width=True, key="curva_s_financeira_tab")
             else:
                 st.warning(
                     "Não foi possível gerar a Curva S financeira. Verifique os lançamentos."
@@ -2203,7 +1617,7 @@ with tabs[4]:
     if kpis:
         st.markdown("#### Tabela de KPIs")
         df_k = pd.DataFrame(kpis)
-        st.dataframe(df_k, width='stretch', height=260)
+        st.dataframe(df_k, use_container_width=True, height=260)
 
         idx_kpi = st.selectbox(
             "Selecione o ponto de KPI para editar / excluir",
@@ -2300,7 +1714,7 @@ with tabs[4]:
             margin=dict(l=30, r=20, t=35, b=30),
         )
         # <-- chave única adicionada para evitar duplicação de elemento
-        st.plotly_chart(fig_kpi, width='stretch', key="kpi_chart_tab")
+        st.plotly_chart(fig_kpi, use_container_width=True, key="kpi_chart_tab")
     else:
         st.info("Nenhum KPI registrado até o momento.")
 
@@ -2370,7 +1784,7 @@ with tabs[5]:
         st.markdown("#### Matriz de riscos (ordenada por criticidade)")
         st.dataframe(
             df_r[["descricao", "impacto", "prob", "indice", "resposta"]],
-            width='stretch',
+            use_container_width=True,
             height=260,
         )
 
@@ -2498,7 +1912,7 @@ with tabs[6]:
 
     if lessons:
         df_l = pd.DataFrame(lessons)
-        st.dataframe(df_l, width='stretch', height=260)
+        st.dataframe(df_l, use_container_width=True, height=260)
 
         idx_lesson = st.selectbox(
             "Selecione a lição para excluir",
@@ -3249,7 +2663,7 @@ with tabs[9]:
     if action_plan:
         df_ap = pd.DataFrame(action_plan)
         st.markdown("#### Ações cadastradas")
-        st.dataframe(df_ap, width='stretch', height=260)
+        st.dataframe(df_ap, use_container_width=True, height=260)
 
         idx_ap = st.selectbox("Selecione a ação para excluir", options=list(range(len(action_plan))),
                               format_func=lambda i: f"{action_plan[i]['descricao'][:60]} - {action_plan[i]['status']}", key="ap_del_idx")
