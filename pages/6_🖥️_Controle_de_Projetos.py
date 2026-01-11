@@ -96,9 +96,14 @@ def _sql_table_exists(insp, table: str) -> bool:
             return False
 
 
-def _ensure_doc_tables(SessionLocal) -> None:
-    """Cria tabelas (Postgres/SQLite) com commit (evita ProgrammingError no Cloud)."""
-    # id
+def _ensure_doc_tables(engine, SessionLocal) -> None:
+    """Cria/atualiza tabelas usadas no Controle de Projetos.
+
+    Importante: faz commit dentro da mesma sessão (no Postgres/Neon isso evita erros de
+    'ProgrammingError' por DDL não persistido entre sessões).
+    """
+    dialect = (getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+
     ddl_pg = """
     CREATE TABLE IF NOT EXISTS project_doc_tasks (
         id SERIAL PRIMARY KEY,
@@ -108,35 +113,35 @@ def _ensure_doc_tables(SessionLocal) -> None:
         doc_name TEXT,
         doc_number TEXT,
         complemento TEXT,
-        project_number TEXT,
-        start_date DATE,
-        delivery_date DATE,
-        status TEXT DEFAULT 'Em andamento - BK',
-        revision_code TEXT DEFAULT 'R0A',
-        observation TEXT,
+        inicio DATE,
+        conclusao DATE,
+        status TEXT,
+        revision_code TEXT,
+        observacao TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
+
     ddl_sqlite = """
     CREATE TABLE IF NOT EXISTS project_doc_tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id INTEGER NOT NULL,
-        service_id INTEGER,
+        service_id INTEGER NULL,
         service_name TEXT,
         doc_name TEXT,
         doc_number TEXT,
         complemento TEXT,
-        project_number TEXT,
-        start_date DATE,
-        delivery_date DATE,
+        inicio DATE,
+        conclusao DATE,
         status TEXT,
         revision_code TEXT,
-        observation TEXT,
+        observacao TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """
+
     ddl_events_pg = """
     CREATE TABLE IF NOT EXISTS doc_status_events (
         id SERIAL PRIMARY KEY,
@@ -149,6 +154,7 @@ def _ensure_doc_tables(SessionLocal) -> None:
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
+
     ddl_events_sqlite = """
     CREATE TABLE IF NOT EXISTS doc_status_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,39 +167,40 @@ def _ensure_doc_tables(SessionLocal) -> None:
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """
-    with SessionLocal() as session:
-        try:
-            session.execute(text(ddl_pg))
-        except Exception:
-            session.execute(text(ddl_sqlite))
-        try:
-            session.execute(text(ddl_events_pg))
-        except Exception:
-            session.execute(text(ddl_events_sqlite))
-        
 
-# Migração defensiva: adiciona colunas novas (doc_name / doc_number)
-try:
-    if dialect == "postgresql":
-        session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN IF NOT EXISTS doc_name TEXT"))
-        session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN IF NOT EXISTS doc_number TEXT"))
-    elif dialect == "sqlite":
-        cols = []
-        try:
-            cols = [r[1] for r in session.execute(text("PRAGMA table_info(project_doc_tasks)")).fetchall()]
-        except Exception:
-            cols = []
-        if "doc_name" not in cols:
-            session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN doc_name TEXT"))
-        if "doc_number" not in cols:
-            session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN doc_number TEXT"))
-except Exception:
-    # não bloqueia a app; logs no Cloud mostram detalhes
-    pass
+    # DDL + migrações (tudo com commit)
+    try:
+        with SessionLocal() as session:
+            # Cria tabelas (tenta Postgres, senão SQLite)
+            try:
+                session.execute(text(ddl_pg))
+            except Exception:
+                session.execute(text(ddl_sqlite))
 
-session.commit()
+            try:
+                session.execute(text(ddl_events_pg))
+            except Exception:
+                session.execute(text(ddl_events_sqlite))
 
+            # Migração defensiva: adiciona colunas novas (doc_name / doc_number)
+            if dialect == "postgresql":
+                session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN IF NOT EXISTS doc_name TEXT"))
+                session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN IF NOT EXISTS doc_number TEXT"))
+            elif dialect == "sqlite":
+                cols = []
+                try:
+                    cols = [r[1] for r in session.execute(text("PRAGMA table_info(project_doc_tasks)")).fetchall()]
+                except Exception:
+                    cols = []
+                if "doc_name" not in cols:
+                    session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN doc_name TEXT"))
+                if "doc_number" not in cols:
+                    session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN doc_number TEXT"))
 
+            session.commit()
+    except Exception:
+        # não bloqueia a app; logs no Cloud mostram detalhes
+        pass
 def _status_to_responsible(status: str) -> str:
     if status == "Em análise - Cliente" or status == "Aprovado - Cliente":
         return "CLIENTE"
@@ -258,7 +265,7 @@ def _list_services(engine) -> pd.DataFrame:
 
 def _list_doc_tasks(engine, SessionLocal, project_id: int) -> pd.DataFrame:
     """Lista linhas da tabela estilo Excel. Usa text()+conn para evitar erro de paramstyle no Cloud."""
-    _ensure_doc_tables(SessionLocal)
+    _ensure_doc_tables(engine, SessionLocal)
     sql = text("""
         SELECT id, service_id, COALESCE(service_name,'') AS service_name,
                COALESCE(complemento,'') AS complemento,
@@ -277,7 +284,7 @@ def _list_doc_tasks(engine, SessionLocal, project_id: int) -> pd.DataFrame:
     except Exception:
         # Se ainda não existir (ou migração atrasada), tenta garantir tabelas e retornar vazio ao invés de quebrar a página
         try:
-            _ensure_doc_tables(SessionLocal)
+            _ensure_doc_tables(engine, SessionLocal)
             with engine.connect() as conn:
                 df = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
         except Exception:
@@ -756,7 +763,7 @@ def main() -> None:
             resp_val = "N/A"
         resp = st.selectbox("Responsável pelo atraso", resp_list, index=resp_list.index(resp_val))
 
-        if st.button("Salvar projeto", type="primary", use_container_width=True):
+        if st.button("Salvar projeto", type="primary", width='stretch'):
             _update_project(SessionLocal, pid, status, progress, planned, actual, resp)
             st.success("Projeto atualizado.")
             st.rerun()
@@ -918,7 +925,7 @@ def main() -> None:
             data=html_report.encode("utf-8"),
             file_name=f"controle_projetos_{pid}.html",
             mime="text/html",
-            use_container_width=True,
+            width='stretch',
         )
     with right:
         st.subheader("Tarefas / Documentos (tabela estilo Excel)")
@@ -961,7 +968,7 @@ with st.expander("➕ Adicionar tarefa/documento", expanded=False):
         new_delivery = st.date_input("Data de conclusão (entrega p/ análise)", value=date.today(), key="new_doc_delivery")
     new_comp = st.text_input("Complemento", key="new_doc_comp")
     new_obs = st.text_area("Observação", key="new_doc_obs")
-    if st.button("Adicionar linha", use_container_width=True):
+    if st.button("Adicionar linha", width='stretch'):
         if not new_service:
             st.warning("Selecione um serviço.")
         else:
@@ -1077,7 +1084,7 @@ with st.expander("➕ Adicionar tarefa/documento", expanded=False):
             edited = st.data_editor(
                 doc_edit_view,
                 num_rows="dynamic",
-                use_container_width=True,
+                width='stretch',
                 column_config=col_cfg,
                 hide_index=True,
                 key="doc_editor",
@@ -1089,7 +1096,7 @@ with st.expander("➕ Adicionar tarefa/documento", expanded=False):
             edited_df['service_id'] = edited_df.get('service_name', '').map(lambda n: services_name_to_id.get(str(n), None))
 
         # excluir selecionados (AgGrid)
-        if selected_rows and st.button("🗑️ Excluir selecionados", type="secondary", use_container_width=True):
+        if selected_rows and st.button("🗑️ Excluir selecionados", type="secondary", width='stretch'):
             sel_ids = {int(r["id"]) for r in selected_rows if r.get("id") is not None}
             df_del = edited_df.copy()
             if "Excluir" not in df_del.columns:
@@ -1099,7 +1106,7 @@ with st.expander("➕ Adicionar tarefa/documento", expanded=False):
             st.success(f"Excluídos: {dele}.")
             st.rerun()
 
-        if st.button("💾 Salvar tabela", type="primary", use_container_width=True):
+        if st.button("💾 Salvar tabela", type="primary", width='stretch'):
             ins, upd, dele = _upsert_doc_tasks(SessionLocal, pid, edited_df, services_map, proj_number)
             st.success(f"Salvo. Inseridos: {ins} | Atualizados: {upd} | Excluídos: {dele}.")
             st.rerun()
@@ -1140,7 +1147,7 @@ with st.expander("➕ Adicionar tarefa/documento", expanded=False):
             st.dataframe(view[[
                 "id","service_name","status","revision_code","revisoes_qtd",
                 "dias_elaboracao_BK","dias_revisao_BK","dias_analise_CLIENTE","dias_total"
-            ]], use_container_width=True, hide_index=True)
+            ]], width='stretch', hide_index=True)
 
             st.divider()
             st.subheader("Exportação (com logos)")
@@ -1150,10 +1157,10 @@ with st.expander("➕ Adicionar tarefa/documento", expanded=False):
             html_doc = _build_doc_report_html(project_name, client_name, logo_bk_b64, logo_cli_b64, doc_df, metrics)
 
             st.download_button("⬇️ Baixar relatório DOC (HTML)", data=html_doc.encode("utf-8"),
-                               file_name=f"controle_documentos_projeto_{pid}.html", mime="text/html", use_container_width=True)
+                               file_name=f"controle_documentos_projeto_{pid}.html", mime="text/html", width='stretch')
             csv_bytes = view.to_csv(index=False).encode("utf-8")
             st.download_button("⬇️ Baixar CSV (tabela+tempos)", data=csv_bytes,
-                               file_name=f"controle_documentos_projeto_{pid}.csv", mime="text/csv", use_container_width=True)
+                               file_name=f"controle_documentos_projeto_{pid}.csv", mime="text/csv", width='stretch')
 
 
 # -------------------------
