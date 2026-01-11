@@ -339,6 +339,16 @@ def _parse_date(val):
     return _to_date(val)
 
 
+
+def _finish_from_start_date(start_date, dur_days):
+    """Término inclusivo: duração=1 => termina no mesmo dia. (MS Project em granularidade de data)"""
+    if start_date is None:
+        return None
+    d = int(dur_days or 0)
+    if d <= 1:
+        return start_date
+    return start_date + timedelta(days=d - 1)
+
 def _iso(d):
     return d.strftime("%Y-%m-%d") if isinstance(d, date) else ""
 
@@ -382,6 +392,13 @@ def schedule_eap(tasks, project_start=None):
     """
     if not tasks:
         return [], None, None
+
+    def _finish_from_start(start_date, dur_days):
+        """Retorna a data de término (inclusiva) considerando duração em dias (1 dia => termina no mesmo dia)."""
+        d = int(dur_days or 0)
+        if d <= 1:
+            return start_date
+        return start_date + timedelta(days=d - 1)
 
     parent_by_id, children_by_id, task_by_id, ordered = _build_hierarchy(tasks)
 
@@ -436,9 +453,10 @@ def schedule_eap(tasks, project_start=None):
             # We'll allow any scheduled predecessor.
             if any(code_to_id[p] not in planned and not is_summary.get(code_to_id[p], False) for p in preds):
                 continue  # predecessor leaf not ready
-            # compute constraint start
-            c_start = project_start
-            dur = int(t.get("duracao") or 0)
+            # compute constraints based on predecessors (MS Project - date granularity)
+            min_start = project_start
+            min_finish = None
+            dur = max(1, int(t.get('duracao') or 1))
             for pcode in preds:
                 pid = code_to_id[pcode]
                 # if predecessor is summary, it will be resolved later; skip constraint until we know it
@@ -446,16 +464,19 @@ def schedule_eap(tasks, project_start=None):
                     continue
                 p_start, p_finish = planned[pid]
                 rel = get_rel(t)
-                if rel == "FS":
-                    c_start = max(c_start, p_finish)
-                elif rel == "SS":
-                    c_start = max(c_start, p_start)
-                elif rel == "FF":
-                    c_start = max(c_start, p_finish - timedelta(days=dur))
-                elif rel == "SF":
-                    c_start = max(c_start, p_start - timedelta(days=dur))
-            start = max(manual_start.get(tid, project_start), c_start)
-            finish = start + timedelta(days=dur)
+                if rel == 'FS':
+                    # Successor starts the day AFTER predecessor finishes (date granularity)
+                    min_start = max(min_start, p_finish + timedelta(days=1))
+                elif rel == 'SS':
+                    min_start = max(min_start, p_start)
+                elif rel == 'FF':
+                    min_finish = max(min_finish or p_finish, p_finish)
+                elif rel == 'SF':
+                    min_finish = max(min_finish or p_start, p_start)
+            start = max(manual_start.get(tid, project_start), min_start)
+            if min_finish is not None:
+                start = max(start, min_finish - timedelta(days=dur - 1))
+            finish = _finish_from_start(start, dur)
             planned[tid] = (start, finish)
             unresolved.remove(tid)
             changed = True
@@ -465,7 +486,7 @@ def schedule_eap(tasks, project_start=None):
         t = task_by_id[tid]
         dur = int(t.get("duracao") or 0)
         start = manual_start.get(tid, project_start)
-        planned[tid] = (start, start + timedelta(days=dur))
+        planned[tid] = (start, _finish_from_start(start, max(1, int(dur or 1))))
         unresolved.remove(tid)
 
     # Step 2: compute summary tasks from children (bottom-up)
@@ -486,14 +507,16 @@ def schedule_eap(tasks, project_start=None):
                 # no children scheduled: fall back to manual + dur
                 dur = int(t.get("duracao") or 0)
                 s = manual_start.get(tid, project_start)
-                f = s + timedelta(days=dur)
+                f = _finish_from_start(s, max(1, int(dur or 1)))
             planned[tid] = (s, f)
 
     # Step 3: attach computed fields and real dates
     tasks_out = []
     for t in ordered:
         tid = int(t["id"])
-        ps, pf = planned.get(tid, (manual_start.get(tid, project_start), manual_start.get(tid, project_start) + timedelta(days=int(t.get("duracao") or 0))))
+        fallback_start = manual_start.get(tid, project_start)
+        fallback_finish = _finish_from_start(fallback_start, max(1, int(t.get('duracao') or 1)))
+        ps, pf = planned.get(tid, (fallback_start, fallback_finish))
         out = dict(t)
         out["_ps"] = ps
         out["_pf"] = pf
@@ -1490,6 +1513,31 @@ with tabs[2]:
                 st.download_button("Baixar Relatório HTML", data=html, file_name="relatorio_eap_status.html", mime="text/html")
             except Exception:
                 pass
+
+        # Streamlit mantém valores em session_state quando os widgets têm key fixa.
+        # Ao trocar a atividade selecionada, precisamos atualizar os valores padrão do formulário de edição.
+        if tarefa_sel is None:
+            st.warning('Atividade não encontrada para edição.')
+            st.stop()
+        if st.session_state.get('eap_edit_current_id') != id_sel:
+            st.session_state['eap_edit_current_id'] = id_sel
+            st.session_state['eap_edit_codigo'] = str(tarefa_sel.get('codigo') or '')
+            st.session_state['eap_edit_nivel'] = int(tarefa_sel.get('nivel') or 1)
+            st.session_state['eap_edit_desc'] = str(tarefa_sel.get('descricao') or '')
+            st.session_state['eap_edit_dur'] = int(tarefa_sel.get('duracao') or 1)
+            st.session_state['eap_edit_resp'] = str(tarefa_sel.get('responsavel') or '')
+            st.session_state['eap_edit_pred'] = str(tarefa_sel.get('predecessoras') or '')
+            st.session_state['eap_edit_rel'] = str(tarefa_sel.get('relacao') or 'FS')
+            st.session_state['eap_edit_status'] = str(tarefa_sel.get('status') or '')
+            ip = _to_date(tarefa_sel.get('inicio_planejado')) or dt.date.today()
+            st.session_state['eap_edit_inicio_plan'] = ip
+            st.session_state['eap_edit_fim_plan_view'] = _finish_from_start_date(ip, int(tarefa_sel.get('duracao') or 1))
+            rs = _to_date(tarefa_sel.get('inicio_real'))
+            rf = _to_date(tarefa_sel.get('fim_real'))
+            st.session_state['eap_edit_has_inicio_real'] = bool(rs)
+            st.session_state['eap_edit_inicio_real'] = rs or ip
+            st.session_state['eap_edit_has_fim_real'] = bool(rf)
+            st.session_state['eap_edit_fim_real'] = rf or _finish_from_start_date(ip, int(tarefa_sel.get('duracao') or 1))
 
 
         idx_eap = st.selectbox(
