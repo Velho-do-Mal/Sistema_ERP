@@ -1,21 +1,16 @@
 # bk_erp_shared/theme.py
 # Tema compartilhado do BK_ERP
 # --------------------------------------------------------------------------------
-# Objetivos deste tema (conforme alinhado):
 # - Layout consistente em todas as páginas (sem alterar fontes nem ícones).
 # - Barra lateral em azul claro.
 # - Inputs (combos/entradas) com fundo branco e boa legibilidade.
 # - Visual moderno (cartões, bordas suaves, sombras leves).
 # - NÃO interferir nos RELATÓRIOS (evitar CSS genérico que afeta HTML externo).
 #
-# Observação:
-# - Este arquivo injeta apenas CSS e (opcionalmente) um cabeçalho/brand bar simples.
-# - Caso você tenha uma logo em SVG/PNG, coloque em um destes caminhos (no repo):
-#     assets/logo_bk.svg | assets/logo_bk.png | assets/bk_logo.svg | assets/bk_logo.png
-#   O tema tentará carregar automaticamente. Se não achar, mostra um monograma "BK".
+# Fix de compatibilidade:
+# - Home.py importa: `from bk_erp_shared.theme import apply_theme, load_svg`
+#   Então este arquivo expõe `load_svg()` para manter compatibilidade.
 # --------------------------------------------------------------------------------
-
-from __future__ import annotations
 
 import base64
 from pathlib import Path
@@ -44,8 +39,17 @@ def _file_to_data_uri(path: str) -> str | None:
     return None
 
 
+def load_svg(path: str) -> str:
+    """Compatibilidade: retorna um DATA URI para SVG/PNG/JPG/WebP.
+
+    - Se o arquivo não existir, retorna string vazia.
+    - Pode ser usado direto em <img src="{load_svg(...)}" />
+    """
+    uri = _file_to_data_uri(path)
+    return uri or ""
+
+
 def _default_monogram_svg() -> str:
-    # Monograma minimalista "BK" (SVG inline) – evita depender de arquivo externo.
     svg = r'''
     <svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
       <defs>
@@ -66,7 +70,6 @@ def _default_monogram_svg() -> str:
 
 
 def _pick_brand_logo() -> str:
-    # Tenta localizar uma logo do BK no repo, senão usa monograma.
     candidates = [
         "assets/logo_bk.svg",
         "assets/logo_bk.png",
@@ -109,20 +112,17 @@ def apply_theme(show_brand_bar: bool = True, brand_title: str = "BK Engenharia e
         --bk-sidebar-active: rgba(37, 99, 235, 0.18);
       }
 
-      /* Fundo geral */
       .stApp{
         background: var(--bk-bg);
         color: var(--bk-text);
       }
 
-      /* Container principal */
       section.main > div.block-container{
         max-width: 1280px;
         padding-top: 1.2rem;
         padding-bottom: 2.0rem;
       }
 
-      /* Cartões utilitários (se você usar <div class="bk-card">...) */
       .bk-card{
         background: var(--bk-card);
         border-radius: var(--bk-radius);
@@ -131,7 +131,6 @@ def apply_theme(show_brand_bar: bool = True, brand_title: str = "BK Engenharia e
         padding: 18px 20px;
       }
 
-      /* Títulos utilitários */
       .bk-title{
         font-size: 30px;
         font-weight: 900;
@@ -146,14 +145,12 @@ def apply_theme(show_brand_bar: bool = True, brand_title: str = "BK Engenharia e
         margin: 0;
       }
 
-      /* Botões */
       .stButton>button{
         border-radius: 14px !important;
         border: 1px solid rgba(0,0,0,0.06) !important;
         box-shadow: 0 12px 26px rgba(2,6,23,0.06) !important;
       }
 
-      /* Sidebar */
       section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div{
         background: var(--bk-sidebar-bg) !important;
       }
@@ -174,7 +171,6 @@ def apply_theme(show_brand_bar: bool = True, brand_title: str = "BK Engenharia e
         font-weight: 800 !important;
       }
 
-      /* Inputs e combos (baseweb) com fundo branco */
       div[data-baseweb="input"] > div,
       div[data-baseweb="select"] > div,
       div[data-baseweb="textarea"] textarea,
@@ -201,7 +197,7 @@ def apply_theme(show_brand_bar: bool = True, brand_title: str = "BK Engenharia e
         box-shadow: 0 0 0 3px rgba(37,99,235,0.18) !important;
       }
 
-      /* Tabelas do Streamlit (não aplica em HTML genérico para não mexer nos relatórios) */
+      /* Somente componentes do Streamlit (não afeta relatórios HTML) */
       div[data-testid="stDataFrame"] table,
       div[data-testid="stTable"] table{
         border-collapse: collapse !important;
@@ -221,7 +217,6 @@ def apply_theme(show_brand_bar: bool = True, brand_title: str = "BK Engenharia e
         font-weight: 800 !important;
       }
 
-      /* Brand bar (topo) */
       .bk-topbar{
         background: linear-gradient(90deg, rgba(37,99,235,0.10), rgba(56,189,248,0.10));
         border: 1px solid rgba(15,23,42,0.08);
@@ -257,6 +252,7 @@ def apply_theme(show_brand_bar: bool = True, brand_title: str = "BK Engenharia e
       }
     </style>
     """
+
     st.markdown(css, unsafe_allow_html=True)
 
     if show_brand_bar:
