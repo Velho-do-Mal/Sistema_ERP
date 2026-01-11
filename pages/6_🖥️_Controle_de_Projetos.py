@@ -16,9 +16,6 @@ Requisitos atendidos (Controle de Projetos):
 
 Obs.: Este módulo mantém o painel de projeto e o relatório geral existente.
 """
-
-from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
@@ -1020,3 +1017,218 @@ with st.expander("➕ Adicionar tarefa/documento", expanded=False):
                     "service_name",
                     headerName="Tarefa (Serviço)",
                     editable=True,
+                    cellEditor="agSelectCellEditor",
+                    cellEditorParams={"values": service_names},
+                    width=220,
+                )
+
+            gb.configure_column("project_number", headerName="Nº do projeto", editable=False, width=110)
+            gb.configure_column("start_date", headerName="Data de início", width=130)
+            gb.configure_column("delivery_date", headerName="Data de conclusão", width=170)
+            gb.configure_column("status", headerName="Status", editable=True, width=160)
+            gb.configure_column("revision_code", headerName="Nº Revisão", editable=False, width=90)
+            gb.configure_column("Excluir", headerName="Excluir", editable=True, width=90)
+
+            grid = AgGrid(
+                doc_edit_view,
+                gridOptions=gb.build(),
+                update_mode=GridUpdateMode.MODEL_CHANGED,
+                data_return_mode=DataReturnMode.AS_INPUT,
+                fit_columns_on_grid_load=True,
+                height=360,
+                key="doc_aggrid",
+            )
+            edited_df = pd.DataFrame(grid.get("data", []))
+            selected_rows = grid.get("selected_rows") or []
+        else:
+            edited = st.data_editor(
+                doc_edit_view,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config=col_cfg,
+                hide_index=True,
+                key="doc_editor",
+            )
+            edited_df = pd.DataFrame(edited)
+
+        # pós-processamento: mapear service_name -> service_id
+        if not edited_df.empty and services_name_to_id:
+            edited_df['service_id'] = edited_df.get('service_name', '').map(lambda n: services_name_to_id.get(str(n), None))
+
+        # excluir selecionados (AgGrid)
+        if selected_rows and st.button("🗑️ Excluir selecionados", type="secondary", use_container_width=True):
+            sel_ids = {int(r["id"]) for r in selected_rows if r.get("id") is not None}
+            df_del = edited_df.copy()
+            if "Excluir" not in df_del.columns:
+                df_del["Excluir"] = False
+            df_del.loc[df_del["id"].isin(sel_ids), "Excluir"] = True
+            ins, upd, dele = _upsert_doc_tasks(SessionLocal, pid, df_del, services_map, proj_number)
+            st.success(f"Excluídos: {dele}.")
+            st.rerun()
+
+        if st.button("💾 Salvar tabela", type="primary", use_container_width=True):
+            ins, upd, dele = _upsert_doc_tasks(SessionLocal, pid, edited_df, services_map, proj_number)
+            st.success(f"Salvo. Inseridos: {ins} | Atualizados: {upd} | Excluídos: {dele}.")
+            st.rerun()
+
+        st.divider()
+        st.subheader("Métricas (BK x Cliente)")
+        metrics = _compute_doc_metrics(engine, pid)
+        if metrics.empty:
+            st.info("Sem histórico ainda. Dica: ao mudar o status, o sistema registra eventos e passa a calcular os tempos.")
+        else:
+            # join para mostrar por tarefa
+            view = doc_df.merge(metrics, left_on="id", right_on="doc_task_id", how="left")
+            view = view.fillna({"dias_elaboracao_BK":0,"dias_revisao_BK":0,"dias_analise_CLIENTE":0,"revisoes_qtd":0,"dias_total":0,"revision_code":"R0A"})
+            total_revs = int(view["revisoes_qtd"].sum()) if not view.empty else 0
+            st.metric("Total de revisões (projeto)", total_revs)
+
+            # charts
+            top_total = view.sort_values("dias_total", ascending=False).head(10)
+            if not top_total.empty:
+                st.write("Top 10 - Tempo total")
+                chart_df = top_total[["service_name","dias_total"]].copy()
+                chart_df = chart_df.set_index("service_name")
+                st.bar_chart(chart_df)
+
+            c3, c4 = st.columns(2)
+            with c3:
+                top_cli = view.sort_values("dias_analise_CLIENTE", ascending=False).head(10)
+                if not top_cli.empty:
+                    st.write("Top 10 - Análise (Cliente)")
+                    st.bar_chart(top_cli.set_index("service_name")[["dias_analise_CLIENTE"]])
+            with c4:
+                top_bk = view.sort_values("dias_revisao_BK", ascending=False).head(10)
+                if not top_bk.empty:
+                    st.write("Top 10 - Revisão (BK)")
+                    st.bar_chart(top_bk.set_index("service_name")[["dias_revisao_BK"]])
+
+            st.write("Tabela detalhada")
+            st.dataframe(view[[
+                "id","service_name","status","revision_code","revisoes_qtd",
+                "dias_elaboracao_BK","dias_revisao_BK","dias_analise_CLIENTE","dias_total"
+            ]], use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("Exportação (com logos)")
+            # nomes
+            project_name = str(row.get("nome") or "")
+            client_name = str(row.get("client_name") or row.get("cliente") or "")
+            html_doc = _build_doc_report_html(project_name, client_name, logo_bk_b64, logo_cli_b64, doc_df, metrics)
+
+            st.download_button("⬇️ Baixar relatório DOC (HTML)", data=html_doc.encode("utf-8"),
+                               file_name=f"controle_documentos_projeto_{pid}.html", mime="text/html", use_container_width=True)
+            csv_bytes = view.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Baixar CSV (tabela+tempos)", data=csv_bytes,
+                               file_name=f"controle_documentos_projeto_{pid}.csv", mime="text/csv", use_container_width=True)
+
+
+# -------------------------
+# Projetos: leitura/atualização (defensivo)
+# -------------------------
+def _list_projects_defensive(engine) -> pd.DataFrame:
+    insp = inspect(engine)
+    try:
+        cols_meta = insp.get_columns("projects")
+        cols = [c["name"] for c in cols_meta]
+    except Exception:
+        cols = []
+
+    # campos lógicos
+    planned_col = _pick_column(cols, ["planned_end_date", "planned_end", "dataInicio", "data"])
+    actual_col = _pick_column(cols, ["actual_end_date", "actual_end", "data_conclusao"])
+    progress_col = _pick_column(cols, ["progress_pct", "progresso", "progresso_pct"])
+    delay_col = _pick_column(cols, ["delay_responsibility", "atraso_responsabilidade", "responsavel_atraso"])
+    code_col = _pick_column(cols, ["cod_projeto", "project_code", "project_number", "numero_projeto"])
+    client_name_col = _pick_column(cols, ["client_name", "cliente", "nome_cliente"])
+
+    sel = ["id", "nome", "status"]
+    if code_col:
+        sel.append(f"{code_col} AS cod_projeto")
+    else:
+        sel.append("NULL AS cod_projeto")
+    if client_name_col:
+        sel.append(f"{client_name_col} AS client_name")
+    else:
+        sel.append("NULL AS client_name")
+    if planned_col:
+        sel.append(f"{planned_col} AS planned_end_date")
+    else:
+        sel.append("NULL AS planned_end_date")
+    if actual_col:
+        sel.append(f"{actual_col} AS actual_end_date")
+    else:
+        sel.append("NULL AS actual_end_date")
+    if progress_col:
+        sel.append(f"{progress_col} AS progress_pct")
+    else:
+        sel.append("0 AS progress_pct")
+    if delay_col:
+        sel.append(f"{delay_col} AS delay_responsibility")
+    else:
+        sel.append("'N/A' AS delay_responsibility")
+
+    sql = f"SELECT {', '.join(sel)} FROM projects ORDER BY id DESC"
+    try:
+        df = pd.read_sql(sql, engine)
+    except Exception:
+        df = pd.DataFrame(columns=["id","nome","status","cod_projeto","client_name","planned_end_date","actual_end_date","progress_pct","delay_responsibility"])
+    return df
+
+
+def _update_project(SessionLocal, project_id: int, status: str, progress_pct: int,
+                    planned_end: date, actual_end: date, delay_resp: str) -> None:
+    with SessionLocal() as session:
+        # tenta colunas comuns
+        # status, progress_pct, planned_end_date, actual_end_date, delay_responsibility
+        # (se alguma não existir, o update pode falhar; nesse caso, ignore silenciosamente)
+        try:
+            session.execute(
+                text("""
+                    UPDATE projects SET
+                        status=:st,
+                        progress_pct=:pp,
+                        planned_end_date=:pl,
+                        actual_end_date=:ac,
+                        delay_responsibility=:dr
+                    WHERE id=:id
+                """),
+                {"st": status, "pp": int(progress_pct), "pl": planned_end.isoformat(), "ac": actual_end.isoformat(), "dr": delay_resp, "id": int(project_id)},
+            )
+            session.commit()
+        except Exception:
+            # fallback: atualiza só status (mínimo)
+            try:
+                session.execute(text("UPDATE projects SET status=:st WHERE id=:id"), {"st": status, "id": int(project_id)})
+                session.commit()
+            except Exception:
+                session.rollback()
+
+
+def _get_renderer(engine, SessionLocal):
+    """Tenta usar renderer existente (mantém compatibilidade)."""
+    try:
+        from reports.render_controle_projetos import build_report as rc_build_report  # type: ignore
+
+        def _wrapper(project_id: Optional[int] = None) -> str:
+            projects = _list_projects_defensive(engine)
+            if project_id is not None:
+                projects = projects[projects["id"] == int(project_id)]
+            # tasks "antigas" não são mais o foco; mas mantemos vazio para compatibilidade
+            tasks_df = pd.DataFrame(columns=["id","title","due_date","is_done","assigned_to","delay_responsibility","project_id","data_conclusao","status_tarefa"])
+            today = date.today()
+            projects_local = projects.copy()
+            projects_local["planned_end_date_dt"] = pd.to_datetime(projects_local.get("planned_end_date", pd.NaT), errors="coerce").dt.date
+            projects_overdue = projects_local[projects_local["planned_end_date_dt"].notna() & (projects_local["planned_end_date_dt"] < today)]
+            tasks_overdue = tasks_df.iloc[0:0]
+            return rc_build_report(projects, tasks_df, projects_overdue, tasks_overdue)
+
+        return _wrapper
+    except Exception:
+        def _fallback(project_id: Optional[int] = None) -> str:
+            return "<html><body><h1>Relatório indisponível</h1></body></html>"
+        return _fallback
+
+
+if __name__ == "__main__":
+    main()
