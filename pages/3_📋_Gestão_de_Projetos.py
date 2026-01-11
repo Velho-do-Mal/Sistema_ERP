@@ -1088,7 +1088,7 @@ with tabs[0]:
         alt = tap.get("alteracoesEscopo") or []
         if alt:
             df_alt = pd.DataFrame(alt)
-            st.dataframe(df_alt.tail(5), use_container_width=True, height=160)
+            st.dataframe(df_alt.tail(5), width='stretch', height=160)
         else:
             st.caption("Nenhuma alteração registrada.")
     with col_r:
@@ -1097,7 +1097,7 @@ with tabs[0]:
             df_r = pd.DataFrame(risks)
             st.dataframe(
                 df_r[["descricao", "impacto", "prob", "indice"]].tail(5),
-                use_container_width=True,
+                width='stretch',
                 height=160,
             )
         else:
@@ -1189,7 +1189,7 @@ with tabs[1]:
         alt = tap.get("alteracoesEscopo") or []
         if alt:
             df_alt = pd.DataFrame(alt)
-            st.dataframe(df_alt, use_container_width=True, height=180)
+            st.dataframe(df_alt, width='stretch', height=180)
 
             idx_alt = st.selectbox(
                 "Selecione uma alteração para editar / excluir",
@@ -1392,13 +1392,13 @@ with tabs[2]:
                 column_config=col_cfg,
                 disabled=["inicio_previsto","fim_previsto"],
                 num_rows="dynamic",
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 key="eap_editor_table",
             )
 
         # Botão de exclusão rápida (selecionados no AgGrid)
-        if selected_rows and st.button("🗑️ Excluir selecionados", type="secondary", use_container_width=True):
+        if selected_rows and st.button("🗑️ Excluir selecionados", type="secondary", width='stretch'):
             sel_ids = {int(r["id"]) for r in selected_rows if r.get("id") is not None}
             before = len(eapTasks)
             eapTasks[:] = [t for t in eapTasks if int(t.get("id")) not in sel_ids]
@@ -1406,7 +1406,7 @@ with tabs[2]:
             st.success(f"Excluídas {before - len(eapTasks)} atividades.")
             st.rerun()
 
-        if st.button("💾 Salvar alterações da EAP", type="primary", use_container_width=True):
+        if st.button("💾 Salvar alterações da EAP", type="primary", width='stretch'):
             df_upd = pd.DataFrame(edited_df)
             if df_upd.empty:
                 st.warning("Tabela vazia.")
@@ -1477,6 +1477,30 @@ with tabs[2]:
                 st.rerun()
 
         with st.expander("📄 Relatório EAP (Status)", expanded=False):
+
+            # Logos (opcional) para deixar o relatório no padrão BK
+            l1, l2 = st.columns(2)
+            with l1:
+                bk_logo_file = st.file_uploader("Logo BK (opcional)", type=["png", "jpg", "jpeg", "svg"], key="eap_logo_bk_file")
+            with l2:
+                cliente_logo_file = st.file_uploader("Logo do cliente (opcional)", type=["png", "jpg", "jpeg", "svg"], key="eap_logo_cliente_file")
+
+            def _file_to_data_uri(_f):
+                if not _f:
+                    return ""
+                import base64
+                data = _f.getvalue()
+                name = (_f.name or "").lower()
+                if name.endswith(".svg"):
+                    mime = "image/svg+xml"
+                elif name.endswith(".jpg") or name.endswith(".jpeg"):
+                    mime = "image/jpeg"
+                else:
+                    mime = "image/png"
+                return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
+
+            bk_logo_uri = _file_to_data_uri(bk_logo_file)
+            cliente_logo_uri = _file_to_data_uri(cliente_logo_file)
             cols = ["codigo", "descricao", "nivel", "inicio_previsto", "fim_previsto", "duracao", "status", "responsavel"]
             df_rel = df_eap_sorted.copy()
             # garante colunas
@@ -1484,7 +1508,7 @@ with tabs[2]:
                 if c not in df_rel.columns:
                     df_rel[c] = ""
             df_rel = df_rel[cols].sort_values(by="codigo")
-            st.dataframe(df_rel, use_container_width=True, height=320)
+            st.dataframe(df_rel, width='stretch', height=320)
             csv = df_rel.to_csv(index=False).encode("utf-8")
             st.download_button("Baixar CSV", data=csv, file_name="relatorio_eap_status.csv", mime="text/csv")
 
@@ -1492,27 +1516,77 @@ with tabs[2]:
             st.markdown("##### Curva S e Gantt (Planejado x Real)")
             fig_s = gerar_curva_s_trabalho(eapTasks, tap.get("dataInicio"))
             if fig_s:
-                st.plotly_chart(fig_s, use_container_width=True, key="curva_s_relatorio")
+                st.plotly_chart(fig_s, width='stretch', key="curva_s_relatorio")
             fig_g = gerar_gantt(eapTasks, tap.get("dataInicio"))
             if fig_g:
-                st.plotly_chart(fig_g, use_container_width=True, key="gantt_relatorio")
+                st.plotly_chart(fig_g, width='stretch', key="gantt_relatorio")
 
             # --- Export HTML (tabela + gráficos)
+
             try:
                 import plotly.io as pio
+                from datetime import datetime as _dt
+
+                generated_at = _dt.now().strftime("%d/%m/%Y %H:%M")
+                proj_nome = str(tap.get("nome") or tap.get("nomeProjeto") or tap.get("projeto") or "")
+                proj_code = str(tap.get("cod_projeto") or tap.get("codigo") or tap.get("codProjeto") or "")
+                cliente_nome = str(tap.get("cliente") or tap.get("clienteNome") or tap.get("client_name") or "")
+
+                css = """<style>
+                body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;margin:24px}
+                .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+                .brand{flex:1;text-align:center}
+                .brand h1{margin:0;font-size:22px;letter-spacing:.2px}
+                .meta{font-size:12px;color:#334155;margin-top:6px}
+                .logo{width:130px;height:60px;object-fit:contain}
+                .divider{height:1px;background:#e2e8f0;margin:12px 0}
+                h2{font-size:16px;margin:16px 0 8px}
+                .tbl{border-collapse:collapse;width:100%;font-size:12px}
+                .tbl th,.tbl td{border:1px solid #d1d5db;padding:6px 8px;vertical-align:top}
+                .tbl th{background:#f1f5f9;text-align:left}
+                .muted{color:#64748b}
+                </style>"""
+
+                table_html = df_rel.to_html(index=False, classes="tbl", border=0)
+
+                bk_logo_tag = f'<img class="logo" src="{bk_logo_uri}" />' if bk_logo_uri else ''
+                cli_logo_tag = f'<img class="logo" src="{cliente_logo_uri}" />' if cliente_logo_uri else ''
+
                 html_parts = []
-                html_parts.append("<h2>Relatório EAP (Status)</h2>")
-                html_parts.append(df_rel.to_html(index=False))
+                html_parts.append("<!doctype html><html><head><meta charset='utf-8'>" + css + "</head><body>")
+                html_parts.append("<div class='header'>" + bk_logo_tag + "<div class='brand'>"
+                                  "<h1>BK Engenharia e Tecnologia</h1>"
+                                  f"<div class='meta'>Gerado em: {generated_at}</div>"
+                                  "</div>" + cli_logo_tag + "</div>")
+                html_parts.append("<div class='meta'><b>Cliente:</b> " + (cliente_nome or "-") +
+                                  " &nbsp;&nbsp; <b>Projeto:</b> " + (proj_nome or "-") +
+                                  (f" &nbsp;&nbsp; <b>Código:</b> {proj_code}" if proj_code else "") + "</div>")
+                html_parts.append("<div class='divider'></div>")
+                html_parts.append("<h2>EAP e Status</h2>")
+                html_parts.append(table_html)
+
                 if fig_s:
-                    html_parts.append("<h3>Curva S (Planejado x Real)</h3>")
+                    html_parts.append("<h2>Curva S (Planejado x Real)</h2>")
                     html_parts.append(pio.to_html(fig_s, include_plotlyjs='cdn', full_html=False))
                 if fig_g:
-                    html_parts.append("<h3>Gantt (Planejado x Real)</h3>")
+                    html_parts.append("<h2>Gantt (Planejado x Real)</h2>")
                     html_parts.append(pio.to_html(fig_g, include_plotlyjs=False, full_html=False))
+
+                html_parts.append("</body></html>")
                 html = "\n".join(html_parts).encode("utf-8")
                 st.download_button("Baixar Relatório HTML", data=html, file_name="relatorio_eap_status.html", mime="text/html")
             except Exception:
                 pass
+        idx_eap = st.selectbox(
+            "Selecione a atividade para editar / excluir",
+            options=list(range(len(df_eap_sorted))),
+            format_func=lambda i: f"{df_eap_sorted.iloc[i]['codigo']} - {df_eap_sorted.iloc[i]['descricao'][:60]}",
+            key="eap_del_idx"
+        )
+
+        id_sel = int(df_eap_sorted.iloc[idx_eap]["id"])
+        tarefa_sel = next((t for t in eapTasks if t.get("id") == id_sel), None)
+
 
         # Streamlit mantém valores em session_state quando os widgets têm key fixa.
         # Ao trocar a atividade selecionada, precisamos atualizar os valores padrão do formulário de edição.
@@ -1540,16 +1614,7 @@ with tabs[2]:
             st.session_state['eap_edit_fim_real'] = rf or _finish_from_start_date(ip, int(tarefa_sel.get('duracao') or 1))
 
 
-        idx_eap = st.selectbox(
-            "Selecione a atividade para editar / excluir",
-            options=list(range(len(df_eap_sorted))),
-            format_func=lambda i: f"{df_eap_sorted.iloc[i]['codigo']} - {df_eap_sorted.iloc[i]['descricao'][:60]}",
-            key="eap_del_idx"
-        )
-
-        id_sel = int(df_eap_sorted.iloc[idx_eap]["id"])
-        tarefa_sel = next((t for t in eapTasks if t.get("id") == id_sel), None)
-
+        
         # --------- EDIÇÃO DE ATIVIDADE DA EAP ---------
         if tarefa_sel:
             st.markdown("#### Editar atividade selecionada")
@@ -1592,7 +1657,7 @@ with tabs[2]:
                 inicio_plan_default = _parse_date(tarefa_sel.get("inicio_planejado")) or dt.date.today()
                 inicio_planejado_edit = st.date_input("Início planejado (edição)", value=inicio_plan_default, key="eap_edit_inicio_plan")
             with ed2:
-                fim_plan_calc = inicio_planejado_edit + dt.timedelta(days=int(tarefa_sel.get("duracao", 1)))
+                fim_plan_calc = _finish_from_start_date(inicio_planejado_edit, int(dur_edit or 1))
                 st.date_input("Fim planejado (calculado)", value=fim_plan_calc, disabled=True, key="eap_edit_fim_plan_view")
             with ed3:
                 has_inicio_real_e = st.checkbox("Definir início real", value=bool(_parse_date(tarefa_sel.get("inicio_real"))), key="eap_edit_has_inicio_real")
@@ -1666,14 +1731,14 @@ with tabs[2]:
         if tap.get("dataInicio"):
             fig_s = gerar_curva_s_trabalho(eapTasks, tap["dataInicio"])
             if fig_s:
-                st.plotly_chart(fig_s, use_container_width=True, key="curva_s_trabalho_main")
+                st.plotly_chart(fig_s, width='stretch', key="curva_s_trabalho_main")
             else:
                 st.warning("Não foi possível gerar a Curva S de trabalho.")
             # --- Gantt abaixo da Curva S (solicitado)
             fig_gantt = gerar_gantt(eapTasks, tap["dataInicio"])
             if fig_gantt:
                 st.markdown("#### Gráfico de Gantt (cronograma simplificado)")
-                st.plotly_chart(fig_gantt, use_container_width=True, key="gantt_main")
+                st.plotly_chart(fig_gantt, width='stretch', key="gantt_main")
             else:
                 st.caption("Gantt indisponível - verifique dados da EAP e data de início.")
             # ---- Indicadores rápidos (Prazo e Custo) ----
@@ -1892,7 +1957,7 @@ with tabs[3]:
             "Parcela",
         ]
         st.dataframe(
-            df_fin_display[cols_show], use_container_width=True, height=260
+            df_fin_display[cols_show], width='stretch', height=260
         )
 
         idx_fin = st.selectbox(
@@ -2070,7 +2135,7 @@ with tabs[3]:
             )
             if fig_fluxo:
                 # <-- chave única adicionada para evitar StreamlitDuplicateElementId
-                st.plotly_chart(fig_fluxo, use_container_width=True, key="curva_s_financeira_tab")
+                st.plotly_chart(fig_fluxo, width='stretch', key="curva_s_financeira_tab")
             else:
                 st.warning(
                     "Não foi possível gerar a Curva S financeira. Verifique os lançamentos."
@@ -2138,7 +2203,7 @@ with tabs[4]:
     if kpis:
         st.markdown("#### Tabela de KPIs")
         df_k = pd.DataFrame(kpis)
-        st.dataframe(df_k, use_container_width=True, height=260)
+        st.dataframe(df_k, width='stretch', height=260)
 
         idx_kpi = st.selectbox(
             "Selecione o ponto de KPI para editar / excluir",
@@ -2235,7 +2300,7 @@ with tabs[4]:
             margin=dict(l=30, r=20, t=35, b=30),
         )
         # <-- chave única adicionada para evitar duplicação de elemento
-        st.plotly_chart(fig_kpi, use_container_width=True, key="kpi_chart_tab")
+        st.plotly_chart(fig_kpi, width='stretch', key="kpi_chart_tab")
     else:
         st.info("Nenhum KPI registrado até o momento.")
 
@@ -2305,7 +2370,7 @@ with tabs[5]:
         st.markdown("#### Matriz de riscos (ordenada por criticidade)")
         st.dataframe(
             df_r[["descricao", "impacto", "prob", "indice", "resposta"]],
-            use_container_width=True,
+            width='stretch',
             height=260,
         )
 
@@ -2433,7 +2498,7 @@ with tabs[6]:
 
     if lessons:
         df_l = pd.DataFrame(lessons)
-        st.dataframe(df_l, use_container_width=True, height=260)
+        st.dataframe(df_l, width='stretch', height=260)
 
         idx_lesson = st.selectbox(
             "Selecione a lição para excluir",
@@ -3184,7 +3249,7 @@ with tabs[9]:
     if action_plan:
         df_ap = pd.DataFrame(action_plan)
         st.markdown("#### Ações cadastradas")
-        st.dataframe(df_ap, use_container_width=True, height=260)
+        st.dataframe(df_ap, width='stretch', height=260)
 
         idx_ap = st.selectbox("Selecione a ação para excluir", options=list(range(len(action_plan))),
                               format_func=lambda i: f"{action_plan[i]['descricao'][:60]} - {action_plan[i]['status']}", key="ap_del_idx")
