@@ -1,137 +1,141 @@
 # pages/6_🖥️_Controle_de_Projetos.py
 # -*- coding: utf-8 -*-
 """
-BK_ERP - 🖥️ Controle de Projetos (BK x Cliente)
-
-IMPORTANTE (conforme alinhado com você):
-- Este módulo é INDEPENDENTE do módulo Gestão de Projetos/EAP.
-- O único vínculo é: a lista de projetos vem do cadastro de projetos (tabela `projects`).
-- Aqui nós controlamos DOCUMENTOS/TAREFAS (tabela estilo Excel), logos e relatório HTML.
-
-Principais features nesta página:
-- Seleção do projeto (projects)
-- Formulário de dados do relatório (cliente, nº projeto etc) + upload de logos
-- Tabela estilo Excel (st.data_editor) com colunas:
-  ID, Serviço (do cadastro), Nome do documento, Nº do documento, Revisão,
-  Data de início, Data de conclusão, Status, Responsável, Observação
-- Botão "Salvar tabela" (insert/update/delete)
-- Botão "Baixar relatório (HTML)" com cabeçalho (logos, BK, cliente, projeto) + tabela + gráficos
-
-Correções importantes:
-- login_and_guard(SessionLocal) (o auth.py exige SessionLocal)
-- SQL parametrizada para Postgres/Neon usando sqlalchemy.text() (evita erro ":pid")
+BK_ERP • Controle de Projetos (BK x Cliente)
+-------------------------------------------
+Requisitos atendidos (resumo):
+- Independente do módulo Gestão de Projetos: usa apenas a lista de projetos cadastrados (tabela `projects`).
+- Formulário para informações do relatório (cliente, nome do projeto, nº do projeto, status do projeto, logos).
+- Tabela estilo Excel (st.data_editor) com: ID, Serviço, Nome do documento, Nº do documento, Revisão, Responsável,
+  Data de início, Data de conclusão, Status, Observação, Excluir.
+- Contabiliza tempos BK x Cliente por histórico de status (múltiplas análises e revisões).
+- Incrementa revisão automaticamente ao voltar para "Em revisão - BK" após "Em análise - Cliente" (R0A -> R0B -> ...).
+- Relatório HTML: cabeçalho com logos + cliente/projeto + tabela completa + gráficos (Top 10 tempos).
+- Compatível com Streamlit Cloud + Neon/Postgres (sem placeholders ":pid" quebrando no driver).
 """
 
+from __future__ import annotations
+
 import base64
-import datetime as _dt
-from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from datetime import date, datetime
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 from sqlalchemy import text
 
-from bk_erp_shared.erp_db import get_finance_db, ensure_erp_tables
 from bk_erp_shared.auth import login_and_guard
-from bk_erp_shared.sales import list_product_services
+from bk_erp_shared.erp_db import ensure_erp_tables, get_finance_db
+from bk_erp_shared.theme import apply_theme
 
+# ------------------------------
+# Constantes / opções
+# ------------------------------
+STATUS_OPTIONS = [
+    "Em andamento - BK",     # conta BK
+    "Em análise - Cliente",  # conta Cliente
+    "Em revisão - BK",       # conta BK
+    "Aprovado - Cliente",    # para de contar
+]
 
+RESPONSIBLE_OPTIONS = ["BK", "CLIENTE", "N/A"]
 
-def _rerun():
-    """Compat: Streamlit novo usa st.rerun(); versões antigas usam _rerun()."""
-    try:
-        if hasattr(st, "rerun"):
-            st.rerun()
-        else:
-            _rerun()
-    except Exception:
-        _rerun()
-
-
-# --------------------------
-# Utilidades
-# --------------------------
-def _safe_date(v) -> Optional[_dt.date]:
-    """Converte date/datetime/pandas Timestamp/str em datetime.date (ou None)."""
+# ------------------------------
+# Helpers
+# ------------------------------
+def _to_date(v, fallback: Optional[date] = None) -> Optional[date]:
     if v is None:
-        return None
-    # pandas NaT
-    try:
-        import pandas as _pd
-        if _pd.isna(v):
-            return None
-    except Exception:
-        pass
-
-    if isinstance(v, _dt.date) and not isinstance(v, _dt.datetime):
+        return fallback
+    if isinstance(v, date) and not isinstance(v, datetime):
         return v
-    if isinstance(v, _dt.datetime):
+    if isinstance(v, datetime):
         return v.date()
-
-    # pandas.Timestamp
     try:
         import pandas as _pd
         if isinstance(v, _pd.Timestamp):
             if _pd.isna(v):
-                return None
+                return fallback
             return v.to_pydatetime().date()
     except Exception:
         pass
-
-    # string ISO
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return _dt.datetime.strptime(s, fmt).date()
-            except Exception:
-                continue
-        # último fallback: fromisoformat
-        try:
-            return _dt.date.fromisoformat(s)
-        except Exception:
-            return None
-
-    return None
+    s = str(v).strip()
+    if not s or s.lower() in ("nat", "none"):
+        return fallback
+    try:
+        return datetime.fromisoformat(s.replace("/", "-")).date()
+    except Exception:
+        return fallback
 
 
-def _bytes_to_data_uri(content: bytes, mime: str) -> str:
-    b64 = base64.b64encode(content).decode("utf-8")
+def _file_to_data_uri(uploaded) -> str:
+    """Converte UploadedFile (PNG/JPG/SVG) para data-uri (string)."""
+    if not uploaded:
+        return ""
+    name = (getattr(uploaded, "name", "") or "").lower()
+    data = uploaded.getvalue()
+    if name.endswith(".svg"):
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"data:image/svg+xml;base64,{b64}"
+    # default png/jpg
+    mime = "image/png"
+    if name.endswith(".jpg") or name.endswith(".jpeg"):
+        mime = "image/jpeg"
+    b64 = base64.b64encode(data).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
 
-def _guess_mime(filename: str) -> str:
-    fn = (filename or "").lower()
-    if fn.endswith(".png"):
-        return "image/png"
-    if fn.endswith(".jpg") or fn.endswith(".jpeg"):
-        return "image/jpeg"
-    if fn.endswith(".webp"):
-        return "image/webp"
-    if fn.endswith(".svg"):
-        return "image/svg+xml"
-    return "application/octet-stream"
+def _status_kind(status: str) -> str:
+    s = (status or "").lower()
+    if "análise" in s or "analise" in s:
+        return "analise"
+    if "revis" in s:
+        return "revisao"
+    if "aprov" in s:
+        return "aprovado"
+    return "bk"  # andamento/elaboração
 
 
-# --------------------------
-# Banco / Tabelas deste módulo
-# --------------------------
+def _responsible_from_status(status: str) -> str:
+    k = _status_kind(status)
+    if k == "analise":
+        return "CLIENTE"
+    if k == "aprovado":
+        return "CLIENTE"
+    return "BK"
+
+
+def _next_revision(code: str) -> str:
+    """R0A..R0Z + fallback."""
+    c = (code or "").strip().upper()
+    if not c.startswith("R0") or len(c) < 3:
+        return "R0A"
+    letter = c[2]
+    if not ("A" <= letter <= "Z"):
+        return "R0A"
+    if letter == "Z":
+        return "R0Z"
+    return f"R0{chr(ord(letter) + 1)}"
+
+
+# ------------------------------
+# Banco / schema
+# ------------------------------
 def _ensure_control_tables(engine, SessionLocal) -> None:
-    """Cria / migra tabelas necessárias para este módulo (PG e SQLite)."""
-    # Meta do relatório por projeto
+    """Cria tabelas do Controle de Projetos + migrações leves."""
+    dialect = (getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+
     ddl_meta_pg = """
     CREATE TABLE IF NOT EXISTS project_control_meta (
         project_id INTEGER PRIMARY KEY,
         client_name TEXT,
         project_name TEXT,
         project_number TEXT,
-        logo_bk BYTEA,
-        logo_bk_mime TEXT,
-        logo_client BYTEA,
-        logo_client_mime TEXT,
-        updated_at TIMESTAMP DEFAULT NOW()
+        project_status TEXT,
+        logo_bk_uri TEXT,
+        logo_client_uri TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
     ddl_meta_sqlite = """
@@ -140,137 +144,130 @@ def _ensure_control_tables(engine, SessionLocal) -> None:
         client_name TEXT,
         project_name TEXT,
         project_number TEXT,
-        logo_bk BLOB,
-        logo_bk_mime TEXT,
-        logo_client BLOB,
-        logo_client_mime TEXT,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        project_status TEXT,
+        logo_bk_uri TEXT,
+        logo_client_uri TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """
 
-    # Tabela principal (documentos/tarefas)
     ddl_tasks_pg = """
     CREATE TABLE IF NOT EXISTS project_doc_tasks (
         id SERIAL PRIMARY KEY,
         project_id INTEGER NOT NULL,
         service_id INTEGER NULL,
-        service_label TEXT NULL,
+        service_name TEXT,
         doc_name TEXT,
         doc_number TEXT,
-        revision TEXT,
-        status TEXT,
+        revision_code TEXT,
         responsible TEXT,
-        start_date DATE,
-        end_date DATE,
-        notes TEXT,
-        created_at TIMESTAMP DEFAULT NOW()
+        inicio DATE,
+        conclusao DATE,
+        status TEXT,
+        observacao TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
     ddl_tasks_sqlite = """
     CREATE TABLE IF NOT EXISTS project_doc_tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id INTEGER NOT NULL,
-        service_id INTEGER,
-        service_label TEXT,
+        service_id INTEGER NULL,
+        service_name TEXT,
         doc_name TEXT,
         doc_number TEXT,
-        revision TEXT,
-        status TEXT,
+        revision_code TEXT,
         responsible TEXT,
-        start_date TEXT,
-        end_date TEXT,
-        notes TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        inicio DATE,
+        conclusao DATE,
+        status TEXT,
+        observacao TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """
 
-    with SessionLocal() as conn:
-        # meta
+    ddl_events_pg = """
+    CREATE TABLE IF NOT EXISTS doc_status_events (
+        id SERIAL PRIMARY KEY,
+        doc_task_id INTEGER NOT NULL,
+        project_id INTEGER NOT NULL,
+        event_date DATE NOT NULL,
+        status TEXT NOT NULL,
+        responsible TEXT NOT NULL,
+        revision_code TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    ddl_events_sqlite = """
+    CREATE TABLE IF NOT EXISTS doc_status_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_task_id INTEGER NOT NULL,
+        project_id INTEGER NOT NULL,
+        event_date DATE NOT NULL,
+        status TEXT NOT NULL,
+        responsible TEXT NOT NULL,
+        revision_code TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+
+    ddl_meta = ddl_meta_pg if "postgres" in dialect else ddl_meta_sqlite
+    ddl_tasks = ddl_tasks_pg if "postgres" in dialect else ddl_tasks_sqlite
+    ddl_events = ddl_events_pg if "postgres" in dialect else ddl_events_sqlite
+
+    with SessionLocal() as session:
+        session.execute(text(ddl_meta))
+        session.execute(text(ddl_tasks))
+        session.execute(text(ddl_events))
+        session.commit()
+
+        # migração defensiva: caso versões anteriores não tivessem 'responsible' ou 'doc_number'
         try:
-            conn.execute(text(ddl_meta_pg))
+            session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN responsible TEXT"))
+            session.commit()
         except Exception:
-            conn.execute(text(ddl_meta_sqlite))
-
-        # tasks
+            session.rollback()
         try:
-            conn.execute(text(ddl_tasks_pg))
+            session.execute(text("ALTER TABLE project_doc_tasks ADD COLUMN doc_number TEXT"))
+            session.commit()
         except Exception:
-            conn.execute(text(ddl_tasks_sqlite))
-
-        # migração defensiva (se já existia versão antiga)
-        # Adiciona colunas faltantes sem quebrar
-        _maybe_add_column(conn, engine, "project_doc_tasks", "service_id", "INTEGER")
-        _maybe_add_column(conn, engine, "project_doc_tasks", "service_label", "TEXT")
-        _maybe_add_column(conn, engine, "project_doc_tasks", "doc_number", "TEXT")
-        _maybe_add_column(conn, engine, "project_doc_tasks", "responsible", "TEXT")
-        _maybe_add_column(conn, engine, "project_doc_tasks", "notes", "TEXT")
-        _maybe_add_column(conn, engine, "project_doc_tasks", "status", "TEXT")
-        _maybe_add_column(conn, engine, "project_doc_tasks", "start_date", "DATE")
-        _maybe_add_column(conn, engine, "project_doc_tasks", "end_date", "DATE")
-
-        try:
-            conn.commit()
-        except Exception:
-            pass
+            session.rollback()
 
 
-def _maybe_add_column(conn, engine, table: str, col: str, coltype: str) -> None:
-    """Adiciona coluna se não existir (PG/SQLite)."""
-    try:
-        cols = _get_table_columns(engine, table)
-        if col in cols:
-            return
-        # Postgres
-        try:
-            conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col} {coltype};'))
-        except Exception:
-            # SQLite
-            conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col} {coltype};'))
-    except Exception:
-        # não bloquear a app
-        return
-
-
-def _get_table_columns(engine, table: str) -> set:
-    with engine.connect() as c:
-        try:
-            rows = c.execute(text("""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = :t
-            """), {"t": table}).fetchall()
-            if rows:
-                return {r[0] for r in rows}
-        except Exception:
-            pass
-        try:
-            rows = c.execute(text(f"PRAGMA table_info({table});")).fetchall()
-            return {r[1] for r in rows}
-        except Exception:
-            return set()
-
-
-# --------------------------
-# Consultas
-# --------------------------
+# ------------------------------
+# Queries
+# ------------------------------
 def _list_projects(engine) -> pd.DataFrame:
-    # tabela projects (vem do ERP)
     sql = text("""
-        SELECT id,
-               COALESCE(nome,'') AS nome,
-               COALESCE(status,'') AS status
+        SELECT id, nome, status, dataInicio, gerente
         FROM projects
         ORDER BY id DESC
     """)
     with engine.connect() as conn:
-        return pd.read_sql_query(sql, conn)
+        df = pd.read_sql_query(sql, conn)
+    return df
 
 
-def _load_project(engine, project_id: int) -> Dict[str, Any]:
+def _list_services(engine) -> pd.DataFrame:
     sql = text("""
-        SELECT id, COALESCE(nome,'') AS nome, COALESCE(status,'') AS status
-        FROM projects
-        WHERE id = :pid
+        SELECT id, name
+        FROM product_services
+        WHERE COALESCE(type,'servico')='servico'
+        ORDER BY name ASC
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql_query(sql, conn)
+    return df
+
+
+def _load_meta(engine, project_id: int) -> Dict:
+    sql = text("""
+        SELECT project_id, client_name, project_name, project_number, project_status,
+               logo_bk_uri, logo_client_uri
+        FROM project_control_meta
+        WHERE project_id = :pid
         LIMIT 1
     """)
     with engine.connect() as conn:
@@ -280,600 +277,640 @@ def _load_project(engine, project_id: int) -> Dict[str, Any]:
     return dict(df.iloc[0].to_dict())
 
 
-def _load_meta(engine, project_id: int) -> Dict[str, Any]:
-    sql = text("""
-        SELECT project_id, client_name, project_name, project_number,
-               logo_bk, logo_bk_mime, logo_client, logo_client_mime
-        FROM project_control_meta
-        WHERE project_id = :pid
-        LIMIT 1
-    """)
-    with engine.connect() as conn:
-        df = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
-    if df.empty:
-        return {}
-    row = df.iloc[0].to_dict()
-    return row
-
-
-def _upsert_meta(SessionLocal, project_id: int, payload: Dict[str, Any]) -> None:
-    with SessionLocal() as conn:
-        # UPSERT compatível (PG/SQLite) via tentativa
-        try:
-            conn.execute(
+def _upsert_meta(SessionLocal, project_id: int, meta: Dict) -> None:
+    with SessionLocal() as session:
+        # tenta update
+        upd = session.execute(
+            text("""
+                UPDATE project_control_meta
+                SET client_name=:client_name,
+                    project_name=:project_name,
+                    project_number=:project_number,
+                    project_status=:project_status,
+                    logo_bk_uri=:logo_bk_uri,
+                    logo_client_uri=:logo_client_uri,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE project_id=:pid
+            """),
+            {
+                "pid": int(project_id),
+                "client_name": meta.get("client_name"),
+                "project_name": meta.get("project_name"),
+                "project_number": meta.get("project_number"),
+                "project_status": meta.get("project_status"),
+                "logo_bk_uri": meta.get("logo_bk_uri"),
+                "logo_client_uri": meta.get("logo_client_uri"),
+            },
+        )
+        if upd.rowcount == 0:
+            session.execute(
                 text("""
                     INSERT INTO project_control_meta
-                    (project_id, client_name, project_name, project_number,
-                     logo_bk, logo_bk_mime, logo_client, logo_client_mime, updated_at)
-                    VALUES
-                    (:project_id, :client_name, :project_name, :project_number,
-                     :logo_bk, :logo_bk_mime, :logo_client, :logo_client_mime, NOW())
-                    ON CONFLICT (project_id) DO UPDATE SET
-                        client_name=EXCLUDED.client_name,
-                        project_name=EXCLUDED.project_name,
-                        project_number=EXCLUDED.project_number,
-                        logo_bk=EXCLUDED.logo_bk,
-                        logo_bk_mime=EXCLUDED.logo_bk_mime,
-                        logo_client=EXCLUDED.logo_client,
-                        logo_client_mime=EXCLUDED.logo_client_mime,
-                        updated_at=NOW()
+                    (project_id, client_name, project_name, project_number, project_status, logo_bk_uri, logo_client_uri)
+                    VALUES (:pid, :client_name, :project_name, :project_number, :project_status, :logo_bk_uri, :logo_client_uri)
                 """),
-                {"project_id": int(project_id), **payload},
+                {
+                    "pid": int(project_id),
+                    "client_name": meta.get("client_name"),
+                    "project_name": meta.get("project_name"),
+                    "project_number": meta.get("project_number"),
+                    "project_status": meta.get("project_status"),
+                    "logo_bk_uri": meta.get("logo_bk_uri"),
+                    "logo_client_uri": meta.get("logo_client_uri"),
+                },
             )
-        except Exception:
-            # SQLite fallback
-            conn.execute(
-                text("""
-                    INSERT INTO project_control_meta
-                    (project_id, client_name, project_name, project_number,
-                     logo_bk, logo_bk_mime, logo_client, logo_client_mime, updated_at)
-                    VALUES
-                    (:project_id, :client_name, :project_name, :project_number,
-                     :logo_bk, :logo_bk_mime, :logo_client, :logo_client_mime, CURRENT_TIMESTAMP)
-                    ON CONFLICT(project_id) DO UPDATE SET
-                        client_name=excluded.client_name,
-                        project_name=excluded.project_name,
-                        project_number=excluded.project_number,
-                        logo_bk=excluded.logo_bk,
-                        logo_bk_mime=excluded.logo_bk_mime,
-                        logo_client=excluded.logo_client,
-                        logo_client_mime=excluded.logo_client_mime,
-                        updated_at=CURRENT_TIMESTAMP
-                """),
-                {"project_id": int(project_id), **payload},
-            )
-        try:
-            conn.commit()
-        except Exception:
-            pass
+        session.commit()
 
 
 def _list_doc_tasks(engine, project_id: int) -> pd.DataFrame:
     sql = text("""
         SELECT id,
-               COALESCE(service_id, NULL) AS service_id,
-               COALESCE(service_label,'') AS service_label,
+               COALESCE(service_name,'') AS service_name,
                COALESCE(doc_name,'') AS doc_name,
                COALESCE(doc_number,'') AS doc_number,
-               COALESCE(revision,'') AS revision,
-               COALESCE(status,'') AS status,
+               COALESCE(revision_code,'') AS revision_code,
                COALESCE(responsible,'') AS responsible,
-               start_date,
-               end_date,
-               COALESCE(notes,'') AS notes
+               inicio AS start_date,
+               conclusao AS delivery_date,
+               COALESCE(status,'Em andamento - BK') AS status,
+               COALESCE(observacao,'') AS observation
         FROM project_doc_tasks
         WHERE project_id = :pid
         ORDER BY id DESC
     """)
     with engine.connect() as conn:
         df = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
-    # Normaliza datas para date
-    if "start_date" in df.columns:
-        df["start_date"] = df["start_date"].apply(_safe_date)
-    if "end_date" in df.columns:
-        df["end_date"] = df["end_date"].apply(_safe_date)
+    # normaliza datas
+    for c in ["start_date", "delivery_date"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
     return df
 
 
-def _save_doc_tasks(SessionLocal, project_id: int, original_df: pd.DataFrame, edited_df: pd.DataFrame,
-                    service_map: Dict[str, int]) -> Tuple[int, int, int]:
-    """Persistência simples: deleta linhas marcadas, depois upsert."""
+def _insert_event(SessionLocal, project_id: int, doc_task_id: int, status: str, revision_code: str,
+                  start_date: Optional[date], delivery_date: Optional[date]) -> None:
+    # regra de data do evento: análise/aprovado usa conclusao; BK usa inicio
+    k = _status_kind(status)
+    if k in ("analise", "aprovado"):
+        ev_date = delivery_date or date.today()
+    else:
+        ev_date = start_date or date.today()
+    responsible = _responsible_from_status(status)
+    with SessionLocal() as session:
+        session.execute(
+            text("""
+                INSERT INTO doc_status_events (doc_task_id, project_id, event_date, status, responsible, revision_code)
+                VALUES (:did, :pid, :ev_date, :status, :resp, :rev)
+            """),
+            {
+                "did": int(doc_task_id),
+                "pid": int(project_id),
+                "ev_date": ev_date,
+                "status": status,
+                "resp": responsible,
+                "rev": revision_code or None,
+            },
+        )
+        session.commit()
+
+
+def _upsert_doc_tasks(SessionLocal, engine, project_id: int, edited: pd.DataFrame) -> Tuple[int, int, int]:
+    """Salva tabela: insere/atualiza/exclui. Também registra eventos quando status muda.
+    Retorna (inserted, updated, deleted).
+    """
     inserted = updated = deleted = 0
+    project_id = int(project_id)
 
-    # normaliza colunas
-    df = edited_df.copy()
-    if "Excluir" not in df.columns:
-        df["Excluir"] = False
+    # mapa do status anterior para detectar transições
+    old_df = _list_doc_tasks(engine, project_id)
+    old_map = {int(r["id"]): r for _, r in old_df.iterrows()} if not old_df.empty else {}
 
-    # deletar
-    to_delete = df[(df["Excluir"] == True) & (df["id"].notna())]["id"].tolist()
-    if to_delete:
-        with SessionLocal() as conn:
-            for _id in to_delete:
-                conn.execute(
+    # garante colunas
+    for col in ["Excluir", "status", "revision_code", "responsible"]:
+        if col not in edited.columns:
+            edited[col] = "" if col != "Excluir" else False
+
+    with SessionLocal() as session:
+        for _, row in edited.iterrows():
+            rid = row.get("id")
+            rid_int = int(rid) if (pd.notna(rid) and str(rid).strip() != "") else None
+
+            # delete
+            if bool(row.get("Excluir")) and rid_int:
+                session.execute(
                     text("DELETE FROM project_doc_tasks WHERE id=:id AND project_id=:pid"),
-                    {"id": int(_id), "pid": int(project_id)},
+                    {"id": rid_int, "pid": project_id},
                 )
                 deleted += 1
-            try:
-                conn.commit()
-            except Exception:
-                pass
-        # remove do df antes de upsert
-        df = df[~df["id"].isin(to_delete)].copy()
+                continue
 
-    # upsert
-    with SessionLocal() as conn:
-        for _, row in df.iterrows():
-            rid = row.get("id")
-            service_label = str(row.get("service_label") or "").strip()
-            sid = row.get("service_id")
-            if (sid is None or str(sid) == "" or str(sid) == "nan") and service_label in service_map:
-                sid = service_map[service_label]
-            try:
-                sid_int = int(sid) if sid is not None and str(sid) not in ("", "nan") else None
-            except Exception:
-                sid_int = None
+            service_name = str(row.get("service_name") or "").strip()
+            doc_name = str(row.get("doc_name") or "").strip()
+            doc_number = str(row.get("doc_number") or "").strip()
+            status = str(row.get("status") or "Em andamento - BK").strip()
+            observation = str(row.get("observation") or "").strip()
 
-            payload = {
-                "pid": int(project_id),
-                "service_id": sid_int,
-                "service_label": service_label,
-                "doc_name": str(row.get("doc_name") or "").strip(),
-                "doc_number": str(row.get("doc_number") or "").strip(),
-                "revision": str(row.get("revision") or "").strip(),
-                "status": str(row.get("status") or "").strip(),
-                "responsible": str(row.get("responsible") or "").strip(),
-                "start_date": _safe_date(row.get("start_date")),
-                "end_date": _safe_date(row.get("end_date")),
-                "notes": str(row.get("notes") or "").strip(),
-            }
+            start_date = _to_date(row.get("start_date"))
+            delivery_date = _to_date(row.get("delivery_date"))
+            responsible = str(row.get("responsible") or "").strip() or _responsible_from_status(status)
 
-            if rid is None or str(rid) in ("", "nan"):
-                conn.execute(
+            # revisão: regra automática ao voltar para revisão após análise
+            rev = str(row.get("revision_code") or "").strip().upper()
+            if not rev:
+                rev = "R0A"
+
+            if rid_int and rid_int in old_map:
+                old_status = str(old_map[rid_int].get("status") or "")
+                old_rev = str(old_map[rid_int].get("revision_code") or "").strip().upper() or "R0A"
+                if _status_kind(status) == "revisao" and _status_kind(old_status) == "analise":
+                    # incrementa se usuário não incrementou
+                    if rev == old_rev or not rev:
+                        rev = _next_revision(old_rev)
+
+            # insert or update
+            if not rid_int:
+                # insert
+                res = session.execute(
                     text("""
                         INSERT INTO project_doc_tasks
-                        (project_id, service_id, service_label, doc_name, doc_number, revision,
-                         status, responsible, start_date, end_date, notes)
-                        VALUES
-                        (:pid, :service_id, :service_label, :doc_name, :doc_number, :revision,
-                         :status, :responsible, :start_date, :end_date, :notes)
+                        (project_id, service_name, doc_name, doc_number, revision_code, responsible,
+                         inicio, conclusao, status, observacao)
+                        VALUES (:pid, :service_name, :doc_name, :doc_number, :rev, :responsible,
+                                :inicio, :conclusao, :status, :obs)
+                        RETURNING id
+                    """) if "postgres" in (getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+                    else text("""
+                        INSERT INTO project_doc_tasks
+                        (project_id, service_name, doc_name, doc_number, revision_code, responsible,
+                         inicio, conclusao, status, observacao)
+                        VALUES (:pid, :service_name, :doc_name, :doc_number, :rev, :responsible,
+                                :inicio, :conclusao, :status, :obs)
                     """),
-                    payload,
+                    {
+                        "pid": project_id,
+                        "service_name": service_name,
+                        "doc_name": doc_name,
+                        "doc_number": doc_number,
+                        "rev": rev,
+                        "responsible": responsible,
+                        "inicio": start_date,
+                        "conclusao": delivery_date,
+                        "status": status,
+                        "obs": observation,
+                    },
                 )
                 inserted += 1
-            else:
-                conn.execute(
-                    text("""
-                        UPDATE project_doc_tasks
-                        SET service_id=:service_id,
-                            service_label=:service_label,
-                            doc_name=:doc_name,
-                            doc_number=:doc_number,
-                            revision=:revision,
-                            status=:status,
-                            responsible=:responsible,
-                            start_date=:start_date,
-                            end_date=:end_date,
-                            notes=:notes
-                        WHERE id=:id AND project_id=:pid
-                    """),
-                    {"id": int(rid), **payload},
-                )
-                updated += 1
+                # pega id novo
+                new_id = None
+                try:
+                    new_id = res.scalar()
+                except Exception:
+                    # sqlite: pega last_insert_rowid
+                    try:
+                        new_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+                    except Exception:
+                        new_id = None
+                session.flush()
+                session.commit()
+                if new_id:
+                    _insert_event(SessionLocal, project_id, int(new_id), status, rev, start_date, delivery_date)
+                continue
 
-        try:
-            conn.commit()
-        except Exception:
-            pass
+            # update
+            session.execute(
+                text("""
+                    UPDATE project_doc_tasks
+                    SET service_name=:service_name,
+                        doc_name=:doc_name,
+                        doc_number=:doc_number,
+                        revision_code=:rev,
+                        responsible=:responsible,
+                        inicio=:inicio,
+                        conclusao=:conclusao,
+                        status=:status,
+                        observacao=:obs,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=:id AND project_id=:pid
+                """),
+                {
+                    "id": rid_int,
+                    "pid": project_id,
+                    "service_name": service_name,
+                    "doc_name": doc_name,
+                    "doc_number": doc_number,
+                    "rev": rev,
+                    "responsible": responsible,
+                    "inicio": start_date,
+                    "conclusao": delivery_date,
+                    "status": status,
+                    "obs": observation,
+                },
+            )
+            updated += 1
+
+            # evento se mudou status (ou se mudou revisão em revisão)
+            old = old_map.get(rid_int, {})
+            old_status = str(old.get("status") or "")
+            old_rev = str(old.get("revision_code") or "").strip().upper()
+            if status != old_status or rev != old_rev:
+                session.commit()
+                _insert_event(SessionLocal, project_id, rid_int, status, rev, start_date, delivery_date)
+
+        session.commit()
 
     return inserted, updated, deleted
 
 
-# --------------------------
-# Relatório HTML
-# --------------------------
-def _build_report_html(meta: Dict[str, Any], proj: Dict[str, Any], df: pd.DataFrame) -> str:
-    client = str(meta.get("client_name") or "").strip() or "Cliente"
-    project_name = str(meta.get("project_name") or "").strip() or str(proj.get("nome") or "Projeto")
-    project_number = str(meta.get("project_number") or "").strip()
+def _compute_metrics(engine, project_id: int) -> pd.DataFrame:
+    """Calcula tempos BK x Cliente com base nos eventos."""
+    sql = text("""
+        SELECT doc_task_id, event_date, status, responsible, COALESCE(revision_code,'') AS revision_code
+        FROM doc_status_events
+        WHERE project_id = :pid
+        ORDER BY doc_task_id, event_date, id
+    """)
+    with engine.connect() as conn:
+        ev = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
+    if ev.empty:
+        return pd.DataFrame(columns=["id","dias_BK","dias_CLIENTE","revisoes"])
 
-    # logos (data URI)
-    logo_left = ""
-    if meta.get("logo_bk") is not None:
-        try:
-            logo_left = _bytes_to_data_uri(meta["logo_bk"], meta.get("logo_bk_mime") or "image/png")
-        except Exception:
-            logo_left = ""
-    logo_right = ""
-    if meta.get("logo_client") is not None:
-        try:
-            logo_right = _bytes_to_data_uri(meta["logo_client"], meta.get("logo_client_mime") or "image/png")
-        except Exception:
-            logo_right = ""
+    ev["event_date"] = pd.to_datetime(ev["event_date"], errors="coerce").dt.date
+    today = date.today()
 
-    # tabela HTML (bordas finas cinza claro)
-    def esc(s: str) -> str:
-        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    rows = []
+    for doc_id, g in ev.groupby("doc_task_id"):
+        g = g.sort_values("event_date")
+        dias_bk = 0
+        dias_cli = 0
+        revisoes = 0
+        # conta revisões: eventos em revisão ou revision_code diferente
+        last_rev = ""
+        for i in range(len(g)):
+            cur = g.iloc[i]
+            cur_date = cur["event_date"] or today
+            cur_status = str(cur["status"] or "")
+            cur_kind = _status_kind(cur_status)
+            cur_resp = str(cur["responsible"] or "")
+            cur_rev = str(cur.get("revision_code") or "")
 
-    cols = ["id", "service_label", "doc_name", "doc_number", "revision", "status", "responsible", "start_date", "end_date", "notes"]
-    df2 = df.copy()
-    for c in cols:
-        if c not in df2.columns:
-            df2[c] = ""
-    df2["start_date"] = df2["start_date"].apply(lambda x: _safe_date(x))
-    df2["end_date"] = df2["end_date"].apply(lambda x: _safe_date(x))
+            if cur_kind == "revisao":
+                if cur_rev and cur_rev != last_rev:
+                    revisoes += 1
+                else:
+                    # se não mudou código, ainda assim conta como uma revisão
+                    revisoes += 1
+            if cur_rev:
+                last_rev = cur_rev
 
-    rows_html = []
-    for _, r in df2.iterrows():
-        rows_html.append(
-            "<tr>"
-            f"<td>{esc(str(r['id']))}</td>"
-            f"<td>{esc(str(r['service_label']))}</td>"
-            f"<td>{esc(str(r['doc_name']))}</td>"
-            f"<td>{esc(str(r['doc_number']))}</td>"
-            f"<td>{esc(str(r['revision']))}</td>"
-            f"<td>{esc(str(r['status']))}</td>"
-            f"<td>{esc(str(r['responsible']))}</td>"
-            f"<td>{esc(str(_safe_date(r['start_date']) or ''))}</td>"
-            f"<td>{esc(str(_safe_date(r['end_date']) or ''))}</td>"
-            f"<td>{esc(str(r['notes']))}</td>"
-            "</tr>"
-        )
-    table_html = f"""
-    <table class="bk-table">
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Serviço</th>
-          <th>Nome do documento</th>
-          <th>Nº do documento</th>
-          <th>Revisão</th>
-          <th>Status</th>
-          <th>Responsável</th>
-          <th>Início</th>
-          <th>Conclusão</th>
-          <th>Observação</th>
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(rows_html) if rows_html else '<tr><td colspan="10" style="text-align:center;color:#64748B;">Sem registros</td></tr>'}
-      </tbody>
-    </table>
+            if i < len(g) - 1:
+                next_date = g.iloc[i+1]["event_date"] or today
+            else:
+                # se aprovado, não conta até hoje
+                if cur_kind == "aprovado":
+                    next_date = cur_date
+                else:
+                    next_date = today
+
+            delta = (next_date - cur_date).days
+            if delta < 0:
+                delta = 0
+
+            if cur_resp.upper().startswith("CLI") or cur_kind == "analise":
+                dias_cli += delta
+            else:
+                dias_bk += delta
+
+        rows.append({"id": int(doc_id), "dias_BK": dias_bk, "dias_CLIENTE": dias_cli, "revisoes": revisoes})
+
+    return pd.DataFrame(rows)
+
+
+def _chart_png_b64(df: pd.DataFrame, x: str, y: str, title: str) -> str:
+    """Gera gráfico simples (matplotlib) em PNG base64 data-uri."""
+    try:
+        import matplotlib.pyplot as plt
+        fig = plt.figure(figsize=(8, 3.2))
+        ax = fig.add_subplot(111)
+        ax.bar(df[x].astype(str).tolist(), df[y].astype(float).tolist())
+        ax.set_title(title)
+        ax.tick_params(axis='x', labelrotation=35)
+        fig.tight_layout()
+        bio = BytesIO()
+        fig.savefig(bio, format="png", dpi=150)
+        plt.close(fig)
+        b64 = base64.b64encode(bio.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        return ""
+
+
+def _build_report_html(meta: Dict, tasks_df: pd.DataFrame, metrics_df: pd.DataFrame) -> str:
+    """Monta HTML do relatório (padrão BK: bordas finas cinza claro + gráficos)."""
+    cliente = meta.get("client_name") or "Cliente"
+    proj_nome = meta.get("project_name") or "Projeto"
+    proj_num = meta.get("project_number") or ""
+    proj_status = meta.get("project_status") or ""
+
+    logo_bk_uri = meta.get("logo_bk_uri") or ""
+    logo_cli_uri = meta.get("logo_client_uri") or ""
+
+    # junta para exibir tempos no relatório
+    out = tasks_df.copy()
+    if not metrics_df.empty:
+        out = out.merge(metrics_df, how="left", left_on="id", right_on="id")
+    for c in ["dias_BK", "dias_CLIENTE", "revisoes"]:
+        if c in out.columns:
+            out[c] = out[c].fillna(0).astype(int)
+
+    # gráficos Top 10
+    chart_total = chart_cli = chart_bk = ""
+    if not out.empty:
+        out["dias_total"] = out.get("dias_BK", 0) + out.get("dias_CLIENTE", 0)
+        top_total = out.sort_values("dias_total", ascending=False).head(10)
+        top_cli = out.sort_values("dias_CLIENTE", ascending=False).head(10)
+        top_bk = out.sort_values("dias_BK", ascending=False).head(10)
+        if not top_total.empty:
+            chart_total = _chart_png_b64(top_total, "doc_name", "dias_total", "Top 10 - Tempo total (dias)")
+        if not top_cli.empty:
+            chart_cli = _chart_png_b64(top_cli, "doc_name", "dias_CLIENTE", "Top 10 - Análise (Cliente) (dias)")
+        if not top_bk.empty:
+            chart_bk = _chart_png_b64(top_bk, "doc_name", "dias_BK", "Top 10 - Revisão/Elaboração (BK) (dias)")
+
+    css = """
+    <style>
+      body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 24px; }
+      .hdr { width: 100%; border: 1px solid #e0e0e0; border-radius: 10px; padding: 14px; }
+      .hdr-grid { display: grid; grid-template-columns: 160px 1fr 160px; gap: 10px; align-items: center; }
+      .hdr img { max-height: 72px; max-width: 160px; }
+      .title { text-align: center; }
+      .title h1 { margin: 0; font-size: 18px; }
+      .sub { font-size: 12px; color: #333; margin-top: 4px; }
+      .sub2 { font-size: 12px; color: #333; margin-top: 2px; }
+      .badge { display:inline-block; padding: 2px 8px; border-radius: 10px; border:1px solid #e0e0e0; font-size:11px; color:#333; margin-top:6px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 12px; }
+      th, td { border: 1px solid #d9d9d9; padding: 6px 8px; }
+      th { background: #f5f5f5; }
+      .charts { margin-top: 14px; display: grid; grid-template-columns: 1fr; gap: 14px; }
+      .chart { border: 1px solid #e0e0e0; border-radius: 10px; padding: 10px; }
+      .chart img { width: 100%; height: auto; }
+    </style>
     """
 
-    # gráficos simples (dias total + revisões)
-    dfm = df2.copy()
-    dfm["dias_total"] = dfm.apply(
-        lambda r: (r["end_date"] - r["start_date"]).days if _safe_date(r["start_date"]) and _safe_date(r["end_date"]) else None,
-        axis=1
+    left_logo_html = f'<img src="{logo_bk_uri}" />' if logo_bk_uri else ""
+    right_logo_html = f'<img src="{logo_cli_uri}" />' if logo_cli_uri else ""
+
+    hdr = (
+        '<div class="hdr"><div class="hdr-grid">'
+        f'<div style="text-align:left;">{left_logo_html}</div>'
+        '<div class="title">'
+        '<h1>BK Engenharia e Tecnologia</h1>'
+        f'<div class="sub">Cliente: {cliente}</div>'
+        f'<div class="sub2">Projeto: {proj_nome} &nbsp;&nbsp;|&nbsp;&nbsp; Nº: {proj_num}</div>'
+        f'<div class="badge">Status: {proj_status or "N/D"}</div>'
+        '</div>'
+        f'<div style="text-align:right;">{right_logo_html}</div>'
+        '</div></div>'
     )
-    # revision letter -> numero
-    def rev_to_n(v: str) -> int:
-        s = (v or "").strip().upper()
-        # R0A, R0B ...
-        m = None
-        import re as _re
-        m = _re.search(r'R0([A-Z])', s)
-        if not m:
-            return 0
-        return (ord(m.group(1)) - ord('A')) + 1
 
-    dfm["rev_n"] = dfm["revision"].apply(rev_to_n)
-    chart1 = ""
-    chart2 = ""
-    try:
-        dft = dfm.dropna(subset=["dias_total"])
-        if not dft.empty:
-            fig1 = px.bar(dft, x="doc_name", y="dias_total", title="Dias totais por documento")
-            chart1 = fig1.to_html(full_html=False, include_plotlyjs="cdn")
-    except Exception:
-        chart1 = ""
-    try:
-        dfr = dfm.copy()
-        if not dfr.empty:
-            fig2 = px.bar(dfr, x="doc_name", y="rev_n", title="Nº de revisão (estimado) por documento")
-            chart2 = fig2.to_html(full_html=False, include_plotlyjs=False)
-    except Exception:
-        chart2 = ""
+    # tabela no relatório
+    out_show = out.copy()
+    # ordena colunas principais
+    cols = [c for c in ["id","service_name","doc_name","doc_number","revision_code","responsible","start_date","delivery_date","status","dias_BK","dias_CLIENTE","revisoes","observation"] if c in out_show.columns]
+    out_show = out_show[cols]
 
-    # layout do relatório
-    html = f"""
-    <!doctype html>
-    <html lang="pt-br">
-    <head>
-      <meta charset="utf-8"/>
-      <title>Relatório - Controle de Projetos</title>
-      <style>
-        body {{
-          font-family: Arial, Helvetica, sans-serif;
-          color: #0F172A;
-          margin: 24px;
-        }}
-        .hdr {{
-          display: grid;
-          grid-template-columns: 180px 1fr 180px;
-          align-items: center;
-          gap: 12px;
-          margin-bottom: 14px;
-        }}
-        .hdr .logo {{
-          height: 70px;
-          display:flex;
-          align-items:center;
-          justify-content:center;
-        }}
-        .hdr .logo img {{
-          max-height: 70px;
-          max-width: 170px;
-          object-fit: contain;
-        }}
-        .hdr .center {{
-          text-align: center;
-        }}
-        .hdr .center .title {{
-          font-size: 22px;
-          font-weight: 800;
-        }}
-        .hdr .center .sub {{
-          margin-top: 6px;
-          color: #334155;
-          font-size: 13px;
-        }}
-        .hdr .center .sub2 {{
-          margin-top: 4px;
-          color: #64748B;
-          font-size: 12px;
-        }}
-        .bk-table {{
-          width: 100%;
-          border-collapse: collapse;
-          margin-top: 10px;
-        }}
-        .bk-table th, .bk-table td {{
-          border: 1px solid #D1D5DB;
-          padding: 6px 8px;
-          font-size: 12px;
-        }}
-        .bk-table th {{
-          background: #F1F5F9;
-          text-align: left;
-          font-weight: 700;
-        }}
-        .section {{
-          margin-top: 14px;
-        }}
-      </style>
-    </head>
-    <body>
-      <div class="hdr">
-        <div class="logo">{f'<img src="{logo_left}" />' if logo_left else ''}</div>
-        <div class="center">
-          <div class="title">BK Engenharia e Tecnologia</div>
-          <div class="sub">Cliente: <b>{client}</b></div>
-          <div class="sub2">Projeto: <b>{project_name}</b>{f' • Nº {project_number}' if project_number else ''}</div>
-        </div>
-        <div class="logo">{f'<img src="{logo_right}" />' if logo_right else ''}</div>
-      </div>
+    html = ['<html><head><meta charset="utf-8"/>', css, '</head><body>']
+    html.append(hdr)
+    html.append('<h2>Tarefas / Documentos</h2>')
+    html.append(out_show.to_html(index=False, escape=False))
 
-      <div class="section">
-        {table_html}
-      </div>
-
-      <div class="section">
-        {chart1 if chart1 else ''}
-      </div>
-      <div class="section">
-        {chart2 if chart2 else ''}
-      </div>
-    </body>
-    </html>
-    """
-    return html
+    html.append('<div class="charts">')
+    for uri in [chart_total, chart_cli, chart_bk]:
+        if uri:
+            html.append('<div class="chart">')
+            html.append(f'<img src="{uri}" />')
+            html.append('</div>')
+    html.append('</div>')
+    html.append('</body></html>')
+    return "\n".join(html)
 
 
-# --------------------------
+# ------------------------------
 # UI
-# --------------------------
-def main():
-    # DB / Auth
+# ------------------------------
+def main() -> None:
+    ensure_erp_tables()
     engine, SessionLocal = get_finance_db()
-    ensure_erp_tables(engine, SessionLocal)
+    login_and_guard(SessionLocal)
+    apply_theme()
+
     _ensure_control_tables(engine, SessionLocal)
 
-    login_and_guard(SessionLocal)
+    st.markdown(
+        '<div class="bk-card"><div class="bk-title">🖥️ Controle de Projetos</div>'
+        '<p class="bk-subtitle">Tabela estilo Excel + relatório com tempos BK x Cliente (múltiplas análises/revisões).</p></div>',
+        unsafe_allow_html=True,
+    )
 
-    st.title("🖥️ Controle de Projetos")
-    st.caption("Documentos / tarefas do projeto (BK x Cliente) com tabela estilo Excel e relatório.")
-
-    # Lista de projetos
-    projects_df = _list_projects(engine)
-    if projects_df.empty:
-        st.info("Nenhum projeto cadastrado ainda. Cadastre um projeto no módulo Gestão de Projetos.")
+    projects = _list_projects(engine)
+    if projects.empty:
+        st.info("Nenhum projeto cadastrado em Gestão de Projetos.")
         return
 
-    # Seleção do projeto
-    proj_opts = {f"#{int(r.id)} - {r.nome}": int(r.id) for r in projects_df.itertuples()}
-    proj_label = st.selectbox("Projetos", list(proj_opts.keys()))
-    pid = proj_opts.get(proj_label)
-    if not pid:
-        st.stop()
+    # seletor de projeto (único vínculo com Gestão)
+    proj_opts = {f"#{int(r.id)} - {r.nome}": int(r.id) for r in projects.itertuples()}
+    sel_label = st.selectbox("Selecione o projeto", list(proj_opts.keys()))
+    pid = int(proj_opts[sel_label])
 
-    proj = _load_project(engine, pid) or {}
-    meta = _load_meta(engine, pid) or {}
+    # Defaults vindo do cadastro de projeto
+    proj_row = projects[projects["id"] == pid].iloc[0].to_dict()
+    defaults = {
+        "client_name": proj_row.get("client_name") or proj_row.get("cliente") or "Cliente",
+        "project_name": proj_row.get("nome") or f"Projeto {pid}",
+        "project_number": proj_row.get("cod_projeto") or proj_row.get("project_code") or str(pid),
+        "project_status": proj_row.get("status") or "",
+        "logo_bk_uri": "",
+        "logo_client_uri": "",
+    }
 
-    left, right = st.columns([1, 1.35], gap="large")
+    # carrega meta persistida (se existir)
+    meta_db = _load_meta(engine, pid) or {}
+    meta = {**defaults, **meta_db}
+
+    left, right = st.columns([1, 1], gap="large")
 
     with left:
-        st.subheader("Projeto")
+        st.subheader("📄 Informações do relatório")
+        st.caption("Essas informações são usadas no cabeçalho do relatório e ficam salvas por projeto.")
 
-        status_opts = ["em_planejamento", "em_andamento", "em_aprovacao", "encerrado"]
-        cur_status = (proj.get("status") or "").strip()
-        if cur_status and cur_status not in status_opts:
-            status_opts = [cur_status] + [s for s in status_opts if s != cur_status]
-        status_sel = st.selectbox("Status", status_opts, index=max(0, status_opts.index(cur_status)) if cur_status in status_opts else 0)
-
-        # Campos de prazo (se existirem na tabela; aqui apenas informativo)
-        # Mantemos simples para não conflitar com EAP
-        st.divider()
-        st.subheader("Relatório (HTML)")
-        st.caption("Os dados do relatório e as logos ficam salvos por projeto.")
-
-        with st.form("meta_form"):
+        with st.form("form_meta", clear_on_submit=False):
             client_name = st.text_input("Cliente", value=str(meta.get("client_name") or ""))
-            project_name = st.text_input("Nome do projeto", value=str(meta.get("project_name") or proj.get("nome") or ""))
+            project_name = st.text_input("Nome do projeto", value=str(meta.get("project_name") or ""))
             project_number = st.text_input("Nº do projeto", value=str(meta.get("project_number") or ""))
+            status_options = ["", "Em andamento", "Em atraso", "Concluído", "Pausado"]
+            saved_status = str(meta.get("project_status") or "").strip()
+            try:
+                status_idx = status_options.index(saved_status) if saved_status in status_options else 0
+            except Exception:
+                status_idx = 0
+            project_status = st.selectbox("Status do projeto", status_options, index=status_idx)
 
-            colA, colB = st.columns(2)
-            with colA:
-                logo_bk_file = st.file_uploader("Logo BK (PNG/JPG)", type=["png", "jpg", "jpeg", "webp"], key="logo_bk_upl")
-            with colB:
-                logo_client_file = st.file_uploader("Logo Cliente (PNG/JPG)", type=["png", "jpg", "jpeg", "webp"], key="logo_client_upl")
+            c1, c2 = st.columns(2)
+            with c1:
+                logo_bk_up = st.file_uploader("Logo BK (opcional)", type=["png", "jpg", "jpeg", "svg"])
+            with c2:
+                logo_cli_up = st.file_uploader("Logo Cliente (opcional)", type=["png", "jpg", "jpeg", "svg"])
 
-            saved = st.form_submit_button("Salvar dados do relatório")
+            save_meta = st.form_submit_button("💾 Salvar informações do relatório")
 
-        if saved:
-            payload = {
+        if save_meta:
+            meta_new = {
                 "client_name": client_name.strip(),
                 "project_name": project_name.strip(),
                 "project_number": project_number.strip(),
-                "logo_bk": meta.get("logo_bk"),
-                "logo_bk_mime": meta.get("logo_bk_mime"),
-                "logo_client": meta.get("logo_client"),
-                "logo_client_mime": meta.get("logo_client_mime"),
+                "project_status": str(project_status or "").strip(),
+                "logo_bk_uri": _file_to_data_uri(logo_bk_up) or meta.get("logo_bk_uri") or "",
+                "logo_client_uri": _file_to_data_uri(logo_cli_up) or meta.get("logo_client_uri") or "",
             }
-            if logo_bk_file is not None:
-                payload["logo_bk"] = logo_bk_file.getvalue()
-                payload["logo_bk_mime"] = _guess_mime(logo_bk_file.name)
-            if logo_client_file is not None:
-                payload["logo_client"] = logo_client_file.getvalue()
-                payload["logo_client_mime"] = _guess_mime(logo_client_file.name)
+            _upsert_meta(SessionLocal, pid, meta_new)
+            st.success("Informações do relatório salvas.")
+            st.rerun()
 
-            _upsert_meta(SessionLocal, pid, payload)
-            st.success("Dados do relatório salvos!")
+        st.divider()
 
-            # atualizar meta em memória
-            meta = _load_meta(engine, pid) or {}
+        # Relatório (sempre visível)
+        tasks_df = _list_doc_tasks(engine, pid)
+        metrics_df = _compute_metrics(engine, pid)
 
-        # Atualiza status do projeto (apenas tabela projects)
-        if st.button("Salvar status do projeto"):
-            with SessionLocal() as conn:
-                conn.execute(text("UPDATE projects SET status=:s WHERE id=:id"), {"s": status_sel, "id": int(pid)})
-                try:
-                    conn.commit()
-                except Exception:
-                    pass
-            st.success("Status atualizado.")
+        meta = _load_meta(engine, pid) or meta  # recarrega
+        html_report = _build_report_html(meta, tasks_df, metrics_df)
 
-        # botão relatório
-        df_now = _list_doc_tasks(engine, pid)
-        html = _build_report_html(meta, proj, df_now)
         st.download_button(
-            "📄 Baixar relatório (HTML)",
-            data=html.encode("utf-8"),
-            file_name=f"relatorio_controle_projetos_{pid}.html",
+            "⬇️ Baixar relatório (HTML)",
+            data=html_report.encode("utf-8"),
+            file_name=f"controle_projetos_{pid}.html",
             mime="text/html",
-            width="stretch"
+            width='stretch',
         )
 
+        # também exporta CSV (tabela + tempos)
+        export_df = tasks_df.copy()
+        if not metrics_df.empty and not tasks_df.empty:
+            export_df = export_df.merge(metrics_df, on="id", how="left")
+        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Baixar CSV (tabela + tempos)",
+            data=csv_bytes,
+            file_name=f"controle_projetos_{pid}.csv",
+            mime="text/csv",
+            width='stretch',
+        )
+
+        with st.expander("👁️ Pré-visualizar relatório", expanded=False):
+            st.components.v1.html(html_report, height=700, scrolling=True)
+
     with right:
-        st.subheader("Tarefas / Documentos (tabela estilo Excel)")
-        st.caption("Preencha diretamente na tabela. Use a coluna 'Excluir' para remover linhas.")
+        st.subheader("🧾 Tabela (estilo Excel)")
+        st.caption("Preencha/edite direto na tabela e clique em **Salvar tabela**. Use **Excluir** para remover linhas.")
 
-        # Carrega serviços do cadastro
-        with SessionLocal() as conn:
-            services = list_product_services(conn)
-        services = services[services["active"] == True] if "active" in services.columns else services
-        services = services.sort_values("name") if "name" in services.columns else services
-        service_labels = []
-        service_map = {}
-        for _, r in services.iterrows():
-            label = str(r.get("name") or "").strip()
-            if not label:
-                continue
-            service_labels.append(label)
-            try:
-                service_map[label] = int(r.get("id"))
-            except Exception:
-                pass
-        if not service_labels:
-            service_labels = ["(cadastre serviços em Cadastros > Serviços)"]
+        services_df = _list_services(engine)
+        service_names = services_df["name"].astype(str).tolist() if not services_df.empty else []
 
-        df = _list_doc_tasks(engine, pid)
-        if df.empty:
-            df = pd.DataFrame(columns=[
-                "id", "service_label", "doc_name", "doc_number", "revision", "status",
-                "responsible", "start_date", "end_date", "notes"
+        tasks_df = _list_doc_tasks(engine, pid)
+        if tasks_df.empty:
+            tasks_df = pd.DataFrame(columns=[
+                "id","service_name","doc_name","doc_number","revision_code","responsible",
+                "start_date","delivery_date","status","observation"
             ])
 
-        # coluna excluir
-        if "Excluir" not in df.columns:
-            df["Excluir"] = False
+        # garante colunas
+        if "Excluir" not in tasks_df.columns:
+            tasks_df["Excluir"] = False
 
-        status_options = ["Em andamento - BK", "Em análise - Cliente", "Em revisão - BK", "Aprovado - Cliente"]
-        resp_options = ["BK", "CLIENTE", "N/A"]
+        # botão para adicionar linha vazia (deixa claro onde informar serviço)
+        if st.button("➕ Nova linha", type="secondary", width='stretch'):
+            new_row = {
+                "id": None,
+                "service_name": "",
+                "doc_name": "",
+                "doc_number": "",
+                "revision_code": "R0A",
+                "responsible": "BK",
+                "start_date": date.today(),
+                "delivery_date": date.today(),
+                "status": "Em andamento - BK",
+                "observation": "",
+                "Excluir": False,
+            }
+            tasks_df = pd.concat([pd.DataFrame([new_row]), tasks_df], ignore_index=True)
+
+        # Column configs
+        col_cfg = {
+            "id": st.column_config.NumberColumn("ID", disabled=True),
+            "service_name": st.column_config.SelectboxColumn(
+                "Serviço",
+                options=service_names,
+                help="Vem do cadastro de Serviços (digite para pesquisar).",
+                required=True,
+            ),
+            "doc_name": st.column_config.TextColumn("Nome do documento"),
+            "doc_number": st.column_config.TextColumn("Nº do documento"),
+            "revision_code": st.column_config.TextColumn("Revisão", help="R0A, R0B... Incrementa automático ao voltar para revisão."),
+            "responsible": st.column_config.SelectboxColumn("Responsável", options=RESPONSIBLE_OPTIONS),
+            "start_date": st.column_config.DateColumn("Data de início"),
+            "delivery_date": st.column_config.DateColumn("Data de conclusão"),
+            "status": st.column_config.SelectboxColumn("Status", options=STATUS_OPTIONS),
+            "observation": st.column_config.TextColumn("Observação"),
+            "Excluir": st.column_config.CheckboxColumn("Excluir", help="Marque e clique em Salvar tabela."),
+        }
 
         edited = st.data_editor(
-            df,
-            num_rows="dynamic",
-            use_container_width=True,  # mantém compat com streamlit atual (warning OK)
+            tasks_df,
+            column_config=col_cfg,
             hide_index=True,
-            column_config={
-                "id": st.column_config.NumberColumn("ID", disabled=True),
-                "service_label": st.column_config.SelectboxColumn("Serviço", options=service_labels, required=False),
-                "doc_name": st.column_config.TextColumn("Nome do documento", required=False),
-                "doc_number": st.column_config.TextColumn("Nº do documento", required=False),
-                "revision": st.column_config.TextColumn("Revisão", required=False),
-                "status": st.column_config.SelectboxColumn("Status", options=status_options, required=False),
-                "responsible": st.column_config.SelectboxColumn("Responsável", options=resp_options, required=False),
-                "start_date": st.column_config.DateColumn("Data de início", required=False),
-                "end_date": st.column_config.DateColumn("Data de conclusão", required=False),
-                "notes": st.column_config.TextColumn("Observação", required=False),
-                "Excluir": st.column_config.CheckboxColumn("Excluir"),
-                "service_id": st.column_config.NumberColumn("service_id", disabled=True, help="interno", width="small"),
-            },
+            num_rows="dynamic",
+            width='stretch',
             key=f"doc_editor_{pid}",
         )
 
-        col1, col2, col3 = st.columns([1, 1, 2])
-        with col1:
-            if st.button("💾 Salvar tabela", width="stretch"):
-                ins, upd, dele = _save_doc_tasks(SessionLocal, pid, df, edited, service_map)
-                st.success(f"Salvo! Inseridos: {ins} • Atualizados: {upd} • Excluídos: {dele}")
-                _rerun()
-        with col2:
-            if st.button("🔄 Recarregar", width="stretch"):
-                _rerun()
+        csave1, csave2 = st.columns([1, 1])
+        with csave1:
+            if st.button("💾 Salvar tabela", type="primary", width='stretch'):
+                ins, upd, dele = _upsert_doc_tasks(SessionLocal, engine, pid, edited)
+                st.success(f"Salvo. Inseridos: {ins} | Atualizados: {upd} | Excluídos: {dele}")
+                st.rerun()
+        with csave2:
+            if st.button("🔄 Recarregar", width='stretch'):
+                st.rerun()
 
-        # Prévia rápida de métricas
-        with col3:
-            st.caption("Resumo rápido")
-            dfm = edited.copy()
-            dfm["start_date"] = dfm["start_date"].apply(_safe_date)
-            dfm["end_date"] = dfm["end_date"].apply(_safe_date)
-            total_docs = len(dfm[dfm.get("doc_name").notna()]) if "doc_name" in dfm.columns else len(dfm)
-            aprovados = len(dfm[dfm["status"] == "Aprovado - Cliente"]) if "status" in dfm.columns else 0
-            st.write(f"Documentos/tarefas: **{total_docs}** • Aprovados: **{aprovados}**")
-
-        # Gráficos no app (não mexe no relatório)
         st.divider()
-        st.subheader("Gráficos (visão rápida)")
-        try:
-            dfp = edited.copy()
-            dfp["start_date"] = dfp["start_date"].apply(_safe_date)
-            dfp["end_date"] = dfp["end_date"].apply(_safe_date)
-            dfp["dias_total"] = dfp.apply(
-                lambda r: (r["end_date"] - r["start_date"]).days
-                if r.get("start_date") and r.get("end_date") else None,
-                axis=1
+
+        st.subheader("📊 Indicadores (BK x Cliente)")
+        metrics_df = _compute_metrics(engine, pid)
+        if metrics_df.empty:
+            st.info("Ainda não há eventos de status suficientes para calcular tempos. Salve a tabela para gerar histórico.")
+        else:
+            merged = _list_doc_tasks(engine, pid).merge(metrics_df, on="id", how="left")
+            merged["dias_BK"] = merged["dias_BK"].fillna(0).astype(int)
+            merged["dias_CLIENTE"] = merged["dias_CLIENTE"].fillna(0).astype(int)
+            merged["revisoes"] = merged["revisoes"].fillna(0).astype(int)
+
+            st.dataframe(
+                merged[["id","doc_name","doc_number","revision_code","status","dias_BK","dias_CLIENTE","revisoes"]],
+                width='stretch',
+                hide_index=True,
             )
-            dft = dfp.dropna(subset=["dias_total"])
-            if not dft.empty:
-                st.plotly_chart(px.bar(dft, x="doc_name", y="dias_total", title="Dias totais por documento"), width="stretch")
-            else:
-                st.info("Preencha datas de início e conclusão para ver o gráfico de dias totais.")
-        except Exception as e:
-            st.warning("Não foi possível gerar os gráficos agora (dados incompletos).")
+
+            merged["dias_total"] = merged["dias_BK"] + merged["dias_CLIENTE"]
+            top_total = merged.sort_values("dias_total", ascending=False).head(10)
+            top_cli = merged.sort_values("dias_CLIENTE", ascending=False).head(10)
+            top_bk = merged.sort_values("dias_BK", ascending=False).head(10)
+
+            if not top_total.empty:
+                st.bar_chart(top_total.set_index("doc_name")["dias_total"], width='stretch')
+            if not top_cli.empty:
+                st.bar_chart(top_cli.set_index("doc_name")["dias_CLIENTE"], width='stretch')
+            if not top_bk.empty:
+                st.bar_chart(top_bk.set_index("doc_name")["dias_BK"], width='stretch')
 
 
 if __name__ == "__main__":
