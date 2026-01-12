@@ -38,8 +38,22 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+
 import streamlit as st
 from pathlib import Path
+
+# Tema unificado do ERP (sem alterar fontes/ícones/relatórios)
+try:
+    from bk_erp_shared.theme import apply_theme  # type: ignore
+except Exception:  # pragma: no cover
+    apply_theme = None  # type: ignore
+
+# Exportação XLSX (Streamlit Cloud precisa do openpyxl no requirements)
+try:
+    import openpyxl  # noqa: F401
+    HAS_OPENPYXL = True
+except Exception:  # pragma: no cover
+    HAS_OPENPYXL = False
 
 try:
     import tomllib  # py3.11+
@@ -69,65 +83,7 @@ except Exception:
 st.set_page_config(page_title="BK_ERP - Financeiro", layout="wide")
 
 
-# =========================
-# CSS
-# =========================
-def apply_css():
-    css = """
-    <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
-
-    :root {
-      --primary: #007bff;
-      --accent: #00bcd4;
-      --bg: #f4f6fb;
-      --text: #222;
-      --card-radius: 14px;
-      --card-shadow: 0 10px 26px rgba(17,24,39,0.08);
-      --border: rgba(0,0,0,0.10);
-    }
-    body { background: var(--bg); color: var(--text); font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif; }
-    .big-title { font-size:34px; font-weight:900; color:#0d47a1; margin:0; letter-spacing:-0.02em; }
-    .sub-title { font-size:14px; color:#666; margin-top:2px; }
-    .card {
-        background: #fff; padding: 18px; border-radius:var(--card-radius);
-        box-shadow: var(--card-shadow); border:1px solid var(--border);
-        margin-bottom:16px;
-    }
-    .stat-card { padding:16px; border-radius:var(--card-radius); border:1px solid var(--border); background:white; }
-    .metric-value { font-size:22px; font-weight:800; color: #111; }
-    .metric-label { color:#666; font-size:13px; }
-
-    /* Tabelas com borda cinza escuro */
-    div[data-testid="stDataFrame"] table,
-    div[data-testid="stTable"] table,
-    table { border-collapse: collapse !important; width: 100% !important; table-layout: auto !important; }
-
-    div[data-testid="stDataFrame"] table th,
-    div[data-testid="stDataFrame"] table td,
-    div[data-testid="stTable"] table th,
-    div[data-testid="stTable"] table td,
-    table th, table td {
-      border: 1px solid #5f5f5f !important;
-      padding: 7px 10px !important;
-      white-space: nowrap !important;
-      font-size: 13px !important;
-    }
-
-    div[data-testid="stDataFrame"] table th,
-    div[data-testid="stTable"] table th {
-      background: #f4f4f4 !important;
-      text-align: left !important;
-      font-weight: 800 !important;
-    }
-
-    .footer { color:#666; font-size:12px; margin-top:24px; text-align:center; }
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
-
-
-apply_css()
+# (CSS interno removido: usamos o tema unificado do ERP)
 
 # =========================
 # DATABASE
@@ -239,9 +195,6 @@ class Transaction(Base):
     cost_center_id = Column(Integer, ForeignKey("cost_centers.id"), nullable=True)
     cost_center = relationship("CostCenter")
 
-    # BK_ERP integration: link transactions to a project (optional; no FK for portability)
-    project_id = Column(Integer, nullable=True)
-
     is_transfer = Column(Boolean, default=False)
     transfer_pair_id = Column(String, nullable=True)
     recurrence_group = Column(String, nullable=True)
@@ -339,7 +292,6 @@ def ensure_columns_sqlite(engine):
         try_exec(conn, "ALTER TABLE transactions ADD COLUMN recurrence_group TEXT")
         try_exec(conn, "ALTER TABLE transactions ADD COLUMN reference TEXT")
         try_exec(conn, "ALTER TABLE transactions ADD COLUMN notes TEXT")
-        try_exec(conn, "ALTER TABLE transactions ADD COLUMN project_id INTEGER")
 
         try_exec(conn, "ALTER TABLE attachments ADD COLUMN content_type TEXT")
         try_exec(conn, "ALTER TABLE attachments ADD COLUMN uploaded_at DATETIME")
@@ -391,7 +343,6 @@ def ensure_columns_postgres(engine):
         add_if_missing("transactions", "recurrence_group", "text")
         add_if_missing("transactions", "reference", "text")
         add_if_missing("transactions", "notes", "text")
-        add_if_missing("transactions", "project_id", "integer")
 
         add_if_missing("attachments", "content_type", "text")
         add_if_missing("attachments", "uploaded_at", "timestamp")
@@ -737,7 +688,7 @@ def signed_amount(tx_type: str, amount: float) -> float:
 def st_plotly(fig, height: Optional[int] = None):
     if height:
         fig.update_layout(height=height)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def month_add(d: date, n_months: int) -> date:
@@ -881,6 +832,12 @@ def df_download_link_csv(df: pd.DataFrame, filename: str) -> str:
 
 
 def df_download_link_xlsx(sheets: List[tuple], filename: str) -> str:
+    """Gera link de download XLSX (precisa openpyxl).
+    Se openpyxl não estiver instalado, retorna aviso e não quebra a tela.
+    """
+    if not HAS_OPENPYXL:
+        return "<span style='color:#b45309'>⚠️ Exportação Excel indisponível: instale <b>openpyxl</b> no requirements.</span>"
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet, df in sheets:
@@ -891,7 +848,10 @@ def df_download_link_xlsx(sheets: List[tuple], filename: str) -> str:
                 df.to_excel(writer, sheet_name=safe, index=False)
     data = output.getvalue()
     b64 = base64.b64encode(data).decode()
-    return f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">📥 Baixar Excel</a>'
+    return (
+        f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" '
+        f'download="{filename}">📥 Baixar Excel</a>'
+    )
 
 
 def build_status(t: Transaction) -> str:
@@ -1122,14 +1082,14 @@ def home_ui(SessionLocal):
                 st.metric("Total", format_currency(df_r["Valor"].sum() if not df_r.empty else 0.0))
                 if not df_r.empty:
                     df_r["Valor"] = df_r["Valor"].map(format_currency)
-                    st.dataframe(df_r.drop(columns=["Tipo"]), use_container_width=True, height=220)
+                    st.dataframe(df_r.drop(columns=["Tipo"]), width="stretch", height=220)
             with c_up2:
                 st.markdown("**A Pagar (15 dias)**")
                 df_p = df_u[df_u["Tipo"]=="A Pagar"].copy()
                 st.metric("Total", format_currency(df_p["Valor"].sum() if not df_p.empty else 0.0))
                 if not df_p.empty:
                     df_p["Valor"] = df_p["Valor"].map(format_currency)
-                    st.dataframe(df_p.drop(columns=["Tipo"]), use_container_width=True, height=220)
+                    st.dataframe(df_p.drop(columns=["Tipo"]), width="stretch", height=220)
 
         st.markdown("### Receitas do mês (realizado)")
         df_real_m = pd.DataFrame([{
@@ -1143,7 +1103,7 @@ def home_ui(SessionLocal):
             st.caption("Sem receitas realizadas neste mês.")
         else:
             df_real_m["Valor"] = df_real_m["Valor"].map(format_currency)
-            st.dataframe(df_real_m, use_container_width=True, height=220)
+            st.dataframe(df_real_m, width="stretch", height=220)
 
         overdue = session.query(Transaction).filter(
             Transaction.paid == False,
@@ -1161,14 +1121,14 @@ def home_ui(SessionLocal):
                 "Valor": format_currency(t.amount),
                 "Conta": t.account.name if t.account else "",
             } for t in overdue])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
         st.markdown("### Saldos por conta (realizado)")
         df_bal = compute_account_balances(session)
         if df_bal.empty:
             st.info("Cadastre ao menos uma conta para visualizar saldos.")
         else:
-            st.dataframe(df_bal, use_container_width=True)
+            st.dataframe(df_bal, width="stretch")
 
         st.markdown("### Fluxo mensal (últimos 9 meses)")
         start = month_add(month_start, -8)
@@ -1253,7 +1213,7 @@ def accounts_ui(SessionLocal):
                 "Moeda": a.currency or "BRL",
                 "Obs": (a.notes or "")[:60],
             } for a in accs])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
             col1, col2 = st.columns([1, 2])
             with col1:
@@ -1345,7 +1305,7 @@ def categories_ui(SessionLocal):
                 "Tipo": c.mov_type,
                 "Obs": (c.notes or "")[:60],
             } for c in cats])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
             col1, col2 = st.columns([1, 2])
             with col1:
@@ -1421,7 +1381,7 @@ def clients_suppliers_ui(SessionLocal):
             st.subheader("Lista de Clientes")
             clients = session.query(Client).order_by(Client.name.asc()).all()
             df = pd.DataFrame([{"ID": c.id, "Nome": c.name, "Documento": c.document or "", "Obs": (c.notes or "")[:60]} for c in clients])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
             col1, col2 = st.columns([1, 2])
             with col1:
@@ -1477,7 +1437,7 @@ def clients_suppliers_ui(SessionLocal):
             st.subheader("Lista de Prestadores/Fornecedores")
             sups = session.query(Supplier).order_by(Supplier.name.asc()).all()
             df = pd.DataFrame([{"ID": s.id, "Nome": s.name, "Documento": s.document or "", "Obs": (s.notes or "")[:60]} for s in sups])
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
             col1, col2 = st.columns([1, 2])
             with col1:
@@ -1545,7 +1505,7 @@ def cost_centers_ui(SessionLocal):
         st.subheader("Lista")
         ccs = session.query(CostCenter).order_by(CostCenter.name.asc()).all()
         df = pd.DataFrame([{"ID": c.id, "Nome": c.name, "Obs": (c.notes or "")[:60]} for c in ccs])
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
 
         col1, col2 = st.columns([1, 2])
         with col1:
@@ -1649,7 +1609,7 @@ def goals_ui(SessionLocal):
                         "Categoria": g.category.name if g.category else "",
                         "Obs": (g.notes or "")[:60],
                     })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch")
             else:
                 st.info("Sem metas cadastradas.")
 
@@ -1671,87 +1631,159 @@ def goals_ui(SessionLocal):
                             st.rerun()
 
         with tabs[1]:
-            st.subheader("Cadastrar / Atualizar Orçamento (Categoria x Mês)")
+            st.subheader("Orçamento (12 meses) — Previsto x Realizado")
             years = list(range(date.today().year - 1, date.today().year + 3))
-            months = list(range(1, 13))
+            year = st.selectbox("Ano", years, index=1, key="budget_table_year")
 
-            with st.form("budget_form"):
-                bid = st.number_input("ID (editar, 0=novo)", min_value=0, step=1, value=0, key="bid")
-                cat_sel = st.selectbox("Categoria *", cat_opts, index=0, key="bcat")
-                year = st.selectbox("Ano", years, index=1, key="byear")
-                month = st.selectbox("Mês", months, index=date.today().month - 1, key="bmonth")
-                amount = st.number_input("Valor (R$)", value=0.0, step=100.0, key="bamt")
-                ok = st.form_submit_button("Salvar")
+            st.caption("Edite o **Previsto** por categoria (pai) e mês. O **Realizado** é calculado automaticamente a partir dos lançamentos marcados como realizados (pagos/recebidos).")
 
-            if ok:
-                if cat_sel == "(Sem categoria)":
-                    st.error("Escolha uma categoria.")
-                else:
-                    cat_id = int(cat_sel.split(" - ", 1)[0])
-                    if bid and bid > 0:
-                        b = session.query(Budget).get(int(bid))
-                        if not b:
-                            st.error("ID não encontrado.")
-                        else:
-                            before = {"category_id": b.category_id, "year": b.year, "month": b.month, "amount": b.amount}
-                            b.category_id = cat_id
-                            b.year = int(year)
-                            b.month = int(month)
-                            b.amount = float(amount)
-                            audit(session, "UPDATE", "budgets", b.id, before, {"amount": b.amount})
-                            session.commit()
-                            st.success("Orçamento atualizado.")
-                    else:
-                        exists = session.query(Budget).filter(
-                            Budget.category_id == cat_id,
+            MONTH_LABELS = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez']
+
+            # Categorias pai
+            parents = [c for c in cats if c.parent_id is None]
+            by_id = {c.id: c for c in cats}
+
+            def _root_cat_id(cat_id: int) -> int:
+                cur = by_id.get(cat_id)
+                while cur is not None and cur.parent_id is not None and by_id.get(cur.parent_id) is not None:
+                    cur = by_id.get(cur.parent_id)
+                return int(cur.id) if cur is not None else int(cat_id)
+
+            # Carrega orçamentos previstos (year)
+            buds = session.query(Budget).filter(Budget.year == int(year)).all()
+            bud_map = {(int(b.category_id), int(b.month)): float(b.amount or 0.0) for b in buds}
+
+            def _make_editor_df(cat_list):
+                rows = []
+                for c in cat_list:
+                    row = {"ID": int(c.id), "Categoria": c.name}
+                    for mi, mlabel in enumerate(MONTH_LABELS, start=1):
+                        row[mlabel] = float(bud_map.get((int(c.id), mi), 0.0))
+                    rows.append(row)
+                return pd.DataFrame(rows)
+
+            def _save_editor_df(df_edit: pd.DataFrame) -> int:
+                changed = 0
+                for _, r in df_edit.iterrows():
+                    cid = int(r["ID"])
+                    for mi, mlabel in enumerate(MONTH_LABELS, start=1):
+                        val = r.get(mlabel, 0.0)
+                        try:
+                            amt = float(val or 0.0)
+                        except Exception:
+                            amt = 0.0
+
+                        b = session.query(Budget).filter(
+                            Budget.category_id == cid,
                             Budget.year == int(year),
-                            Budget.month == int(month),
+                            Budget.month == int(mi),
                         ).first()
-                        if exists:
-                            before = {"amount": exists.amount}
-                            exists.amount = float(amount)
-                            audit(session, "UPDATE", "budgets", exists.id, before, {"amount": exists.amount})
-                            session.commit()
-                            st.success("Orçamento atualizado (registro existente).")
-                        else:
-                            b = Budget(category_id=cat_id, year=int(year), month=int(month), amount=float(amount))
+
+                        if amt <= 0:
+                            if b is not None:
+                                before = {"category_id": b.category_id, "year": b.year, "month": b.month, "amount": b.amount}
+                                session.delete(b)
+                                audit(session, "DELETE", "budgets", int(b.id), before, None)
+                                changed += 1
+                            continue
+
+                        if b is None:
+                            b = Budget(category_id=cid, year=int(year), month=int(mi), amount=amt)
                             session.add(b)
                             session.flush()
-                            audit(session, "CREATE", "budgets", b.id, None, {"amount": b.amount})
-                            session.commit()
-                            st.success("Orçamento criado.")
-
-            st.markdown("---")
-            st.subheader("Lista de Orçamentos")
-            buds = session.query(Budget).order_by(Budget.year.desc(), Budget.month.desc()).limit(500).all()
-            if buds:
-                df = pd.DataFrame([{
-                    "ID": b.id,
-                    "Ano": b.year,
-                    "Mês": b.month,
-                    "Categoria": b.category.name if b.category else "",
-                    "Valor": format_currency(b.amount),
-                } for b in buds])
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.info("Sem orçamentos cadastrados.")
-
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                del_id = st.number_input("ID para excluir", min_value=0, step=1, value=0, key="bud_del")
-            with col2:
-                if st.button("Excluir orçamento", type="secondary"):
-                    if del_id and del_id > 0:
-                        b = session.query(Budget).get(int(del_id))
-                        if not b:
-                            st.error("ID não encontrado.")
+                            audit(session, "CREATE", "budgets", int(b.id), None, {"category_id": cid, "year": int(year), "month": int(mi), "amount": amt})
+                            changed += 1
                         else:
-                            before = {"amount": b.amount}
-                            session.delete(b)
-                            audit(session, "DELETE", "budgets", del_id, before, None)
-                            session.commit()
-                            st.success("Excluído.")
-                            st.rerun()
+                            if float(b.amount or 0.0) != float(amt):
+                                before = {"amount": b.amount}
+                                b.amount = amt
+                                audit(session, "UPDATE", "budgets", int(b.id), before, {"amount": amt})
+                                changed += 1
+                if changed:
+                    session.commit()
+                return changed
+
+            entradas = [c for c in parents if (c.mov_type or "both") == "entrada"]
+            saidas = [c for c in parents if (c.mov_type or "both") == "saida"]
+
+            st.markdown("### <span style='color:#2563eb'>Entradas (Previsto)</span>", unsafe_allow_html=True)
+            df_in = _make_editor_df(entradas)
+            df_in_edit = st.data_editor(
+                df_in,
+                hide_index=True,
+                disabled=["ID", "Categoria"],
+                key="budget_in_editor",
+                width="stretch",
+            )
+
+            st.markdown("### <span style='color:#dc2626'>Saídas (Previsto)</span>", unsafe_allow_html=True)
+            df_out = _make_editor_df(saidas)
+            df_out_edit = st.data_editor(
+                df_out,
+                hide_index=True,
+                disabled=["ID", "Categoria"],
+                key="budget_out_editor",
+                width="stretch",
+            )
+
+            if st.button("💾 Salvar orçamento previsto", key="btn_save_budget_table"):
+                changed = _save_editor_df(df_in_edit) + _save_editor_df(df_out_edit)
+                st.success(f"Orçamento salvo. Alterações aplicadas: {changed}.")
+                st.rerun()
+
+            # Realizado por mês (pagos/recebidos)
+            txs = session.query(Transaction).filter(Transaction.paid == True).all()
+            actual_in = {m: 0.0 for m in range(1, 13)}
+            actual_out = {m: 0.0 for m in range(1, 13)}
+            for t in txs:
+                dref = t.paid_date or t.date
+                if not dref or int(dref.year) != int(year):
+                    continue
+                if t.type == "entrada":
+                    actual_in[int(dref.month)] += float(t.amount or 0.0)
+                elif t.type == "saida":
+                    actual_out[int(dref.month)] += float(t.amount or 0.0)
+
+            # Previsto por mês (somatório da tabela)
+            planned_in = {m: 0.0 for m in range(1, 13)}
+            planned_out = {m: 0.0 for m in range(1, 13)}
+            for mi, mlabel in enumerate(MONTH_LABELS, start=1):
+                planned_in[mi] = float(df_in_edit[mlabel].sum()) if not df_in_edit.empty else 0.0
+                planned_out[mi] = float(df_out_edit[mlabel].sum()) if not df_out_edit.empty else 0.0
+
+            planned_net = [planned_in[m] - planned_out[m] for m in range(1, 13)]
+            actual_net = [actual_in[m] - actual_out[m] for m in range(1, 13)]
+
+            tot_plan_in = sum(planned_in.values())
+            tot_plan_out = sum(planned_out.values())
+            tot_act_in = sum(actual_in.values())
+            tot_act_out = sum(actual_out.values())
+
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                st.metric("Entradas (Previsto)", format_currency(tot_plan_in))
+                st.caption(f"Realizado: {format_currency(tot_act_in)}")
+            with k2:
+                st.metric("Saídas (Previsto)", format_currency(tot_plan_out))
+                st.caption(f"Realizado: {format_currency(tot_act_out)}")
+            with k3:
+                st.metric("Saldo (Previsto)", format_currency(tot_plan_in - tot_plan_out))
+                st.caption(f"Realizado: {format_currency(tot_act_in - tot_act_out)}")
+
+            # Gráfico: colunas (saldo mensal) + linhas (saldo acumulado)
+            fig = go.Figure()
+            fig.add_bar(x=MONTH_LABELS, y=planned_net, name="Previsto (saldo mensal)")
+            fig.add_bar(x=MONTH_LABELS, y=actual_net, name="Realizado (saldo mensal)")
+            fig.add_scatter(x=MONTH_LABELS, y=list(pd.Series(planned_net).cumsum()), name="Saldo acumulado previsto", mode="lines+markers", yaxis="y2")
+            fig.add_scatter(x=MONTH_LABELS, y=list(pd.Series(actual_net).cumsum()), name="Saldo acumulado realizado", mode="lines+markers", yaxis="y2")
+            fig.update_layout(
+                barmode="group",
+                margin=dict(l=10, r=10, t=30, b=10),
+                yaxis_title="Saldo mensal (R$)",
+                yaxis2=dict(title="Saldo acumulado (R$)", overlaying="y", side="right"),
+                legend=dict(orientation="h"),
+            )
+            st.plotly_chart(fig, width="stretch")
 
     except Exception as e:
         session.rollback()
@@ -1788,7 +1820,11 @@ def add_transaction_ui(SessionLocal):
             use_due = st.checkbox("Usar vencimento", value=True)
 
             paid = st.checkbox("Já está realizado?", value=False)
-            paid_date = st.date_input("Data de pagamento/recebimento", value=date.today())
+            paid_date = None
+            if paid:
+                paid_date = st.date_input("Data de pagamento/recebimento", value=date.today())
+            else:
+                st.caption("Data de pagamento/recebimento: será preenchida quando marcar como realizado.")
 
             description = st.text_input("Descrição *")
             amount = st.number_input("Valor *", value=0.0, step=100.0)
@@ -1951,7 +1987,7 @@ def add_transaction_ui(SessionLocal):
         else:
             df_show = df_ext.copy()
             df_show["Valor"] = df_show["Valor"].map(format_currency)
-            st.dataframe(df_show, use_container_width=True)
+            st.dataframe(df_show, width="stretch")
 
             cexp1, cexp2 = st.columns([1, 1])
             with cexp1:
@@ -1980,7 +2016,11 @@ def add_transaction_ui(SessionLocal):
                         e_due = st.date_input("Vencimento", value=t.due_date or t.date)
                         e_use_due = st.checkbox("Usar vencimento", value=bool(t.due_date))
                         e_paid = st.checkbox("Realizado", value=bool(t.paid))
-                        e_paid_date = st.date_input("Pagamento/Recebimento", value=t.paid_date or date.today())
+                        e_paid_date = None
+                        if e_paid:
+                            e_paid_date = st.date_input("Pagamento/Recebimento", value=t.paid_date or date.today())
+                        else:
+                            st.caption("Pagamento/Recebimento: será preenchido quando marcar como realizado.")
                         e_desc = st.text_input("Descrição", value=t.description)
                         e_amount = st.number_input("Valor", value=float(t.amount), step=100.0)
                         e_type = st.selectbox("Mov", ["entrada", "saida"], index=0 if t.type == "entrada" else 1)
@@ -2194,7 +2234,7 @@ def dashboards_ui(SessionLocal):
                 for c in ["previsto", "realizado", "dif", "cum_previsto", "cum_realizado"]:
                     show[c] = show[c].map(format_currency)
                 st.subheader("Tabela (Fluxo de Caixa)")
-                st.dataframe(show, use_container_width=True)
+                st.dataframe(show, width="stretch")
 
             st.markdown("### Visão por Centro de Custo")
             df_cc = breakdown_by(session, txs_period, "Centro de Custo")
@@ -2211,7 +2251,7 @@ def dashboards_ui(SessionLocal):
             if df_bal.empty:
                 st.info("Cadastre contas para ver saldos.")
             else:
-                st.dataframe(df_bal, use_container_width=True)
+                st.dataframe(df_bal, width="stretch")
 
         with sub[1]:
             c1, c2, c3 = st.columns([2, 2, 2])
@@ -2237,7 +2277,7 @@ def dashboards_ui(SessionLocal):
                 df_top = df_cat.sort_values("Abs", ascending=False).drop(columns=["Abs"]).head(20)
                 fig2 = px.bar(df_top, x="Valor", y="Item", orientation="h", title=f"Top Categorias ({base_r})")
                 st_plotly(fig2, height=520)
-                st.dataframe(df_cat.rename(columns={"Item": "Categoria"}), use_container_width=True)
+                st.dataframe(df_cat.rename(columns={"Item": "Categoria"}), width="stretch")
 
             st.markdown("---")
             st.subheader("Relatório por Centro de Custo")
@@ -2249,7 +2289,7 @@ def dashboards_ui(SessionLocal):
                 df_topcc = df_cc2.sort_values("Abs", ascending=False).drop(columns=["Abs"]).head(20)
                 fig3 = px.bar(df_topcc, x="Valor", y="Item", orientation="h", title=f"Top Centros de Custo ({base_r})")
                 st_plotly(fig3, height=520)
-                st.dataframe(df_cc2.rename(columns={"Item": "Centro de Custo"}), use_container_width=True)
+                st.dataframe(df_cc2.rename(columns={"Item": "Centro de Custo"}), width="stretch")
 
             st.markdown("---")
             st.subheader("Extrato (para exportação)")
@@ -2279,7 +2319,7 @@ def dashboards_ui(SessionLocal):
             else:
                 df_show = df_ext.copy()
                 df_show["Valor"] = df_show["Valor"].map(format_currency)
-                st.dataframe(df_show, use_container_width=True)
+                st.dataframe(df_show, width="stretch")
 
                 cexp1, cexp2 = st.columns([1, 1])
                 with cexp1:
@@ -2302,10 +2342,12 @@ def dashboards_ui(SessionLocal):
 # MAIN
 # =========================
 def main():
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='big-title'>BK - Gestão Financeira</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sub-title'>Lançamentos, dashboards, relatórios, metas e orçamento</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Aplica o tema unificado do ERP (mantém padrão visual entre páginas)
+    if apply_theme:
+        apply_theme()
+
+    st.title("💰 Financeiro")
+    st.caption("Lançamentos, dashboards, relatórios, metas e orçamento")
 
     engine, SessionLocal = get_db()
     st.sidebar.caption(f"DB: {engine.dialect.name}")
@@ -2393,7 +2435,7 @@ def clients_ui(SessionLocal):
 
         # Listagem
         df = pd.read_sql(text("SELECT id, name, document, notes FROM clients ORDER BY name"), session.bind)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
 
         with st.expander("🗑️ Excluir cliente"):
             did = st.number_input("ID para excluir", min_value=0, step=1, value=0, key="del_client_id")
@@ -2444,7 +2486,7 @@ def suppliers_ui(SessionLocal):
                     st.success(f"Fornecedor criado (ID {s.id}).")
 
         df = pd.read_sql(text("SELECT id, name, document, notes FROM suppliers ORDER BY name"), session.bind)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
 
         with st.expander("🗑️ Excluir fornecedor"):
             did = st.number_input("ID para excluir", min_value=0, step=1, value=0, key="del_supplier_id")
