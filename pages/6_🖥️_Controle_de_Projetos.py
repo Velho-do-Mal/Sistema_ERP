@@ -675,31 +675,42 @@ def _build_report_html(meta: Dict, tasks_df: pd.DataFrame, metrics_df: pd.DataFr
     # tabela no relatório
     out_show = out.copy()
 
-    # Mantém o padrão do TEMPLATE: somente as colunas abaixo e nesta ordem
     desired = [
         "id",
         "service_name",
         "doc_name",
         "doc_number",
-        "revision",
+        "revision_code",
         "responsible",
         "start_date",
-        "end_date",
+        "delivery_date",
+        "status",
+        "observation",
+        # opcional: métricas calculadas (se quiser no relatório)
+        "dias_BK",
+        "dias_CLIENTE",
+        "revisoes",
     ]
+
     cols = [c for c in desired if c in out_show.columns]
     out_show = out_show[cols]
 
-    # Renomeia cabeçalhos exatamente como solicitado (padrão do template)
     out_show = out_show.rename(columns={
         "id": "ID",
         "service_name": "SERVIÇO",
         "doc_name": "NOME DO DOCUMENTO",
         "doc_number": "NUMERO DO DOCUMENTO",
-        "revision": "REVISÃO",
+        "revision_code": "REVISÃO",
         "responsible": "RESPONSÁVEL",
         "start_date": "DATA DE INÍCIO",
-        "end_date": "DATA DE CONCLUSÃO",
+        "delivery_date": "DATA DE CONCLUSÃO",
+        "status": "STATUS",
+        "observation": "OBSERVAÇÃO",
+        "dias_BK": "DIAS BK",
+        "dias_CLIENTE": "DIAS CLIENTE",
+        "revisoes": "REVISÕES",
     })
+
     html = ['<html><head><meta charset="utf-8"/>', css, '</head><body>']
     html.append(hdr)
     html.append('<h2>Tarefas / Documentos</h2>')
