@@ -66,7 +66,7 @@ except Exception:  # pragma: no cover
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Date, DateTime, Float,
-    LargeBinary, Text, ForeignKey, Boolean, Index, text
+    LargeBinary, Text, ForeignKey, Boolean, Index, text, func
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -1162,6 +1162,12 @@ def accounts_ui(SessionLocal):
             currency = st.text_input("Moeda", value="BRL")
             active = st.checkbox("Ativa", value=True)
             notes = st.text_area("Observações")
+
+            attachments = st.file_uploader(
+                "Anexos (boletos/comprovantes/recibos) — opcional",
+                accept_multiple_files=True,
+                key="tx_new_attachments",
+            )
             ok = st.form_submit_button("Salvar")
 
         if ok:
@@ -1639,6 +1645,11 @@ def goals_ui(SessionLocal):
 
             MONTH_LABELS = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez']
 
+            money_cols = {
+                m: st.column_config.NumberColumn(m, format="R$ %.2f", step=100.0)
+                for m in MONTH_LABELS
+            }
+
             # Categorias pai
             parents = [c for c in cats if c.parent_id is None]
             by_id = {c.id: c for c in cats}
@@ -1712,6 +1723,7 @@ def goals_ui(SessionLocal):
                 df_in,
                 hide_index=True,
                 disabled=["ID", "Categoria"],
+                column_config=money_cols,
                 key="budget_in_editor",
                 width="stretch",
             )
@@ -1722,6 +1734,7 @@ def goals_ui(SessionLocal):
                 df_out,
                 hide_index=True,
                 disabled=["ID", "Categoria"],
+                column_config=money_cols,
                 key="budget_out_editor",
                 width="stretch",
             )
@@ -1860,6 +1873,28 @@ def add_transaction_ui(SessionLocal):
                 due = due_date if use_due else None
                 pd_dt = paid_date if paid else None
 
+                # Anexos (opcional): boletos, comprovantes, recibos, etc.
+                uploaded_payloads = []
+                for up in (attachments or []):
+                    try:
+                        data = up.getvalue() if hasattr(up, "getvalue") else up.read()
+                    except Exception:
+                        data = b""
+                    if not data:
+                        continue
+                    uploaded_payloads.append((up.name, getattr(up, "type", None), data))
+
+                def _save_attachments_for(tx_id: int):
+                    for fname, ctype, data in uploaded_payloads:
+                        att = Attachment(
+                            transaction_id=int(tx_id),
+                            filename=str(fname),
+                            content_type=ctype,
+                            data=data,
+                        )
+                        session.add(att)
+                        audit(session, "CREATE", "attachments", None, None, {"tx_id": int(tx_id), "filename": str(fname)})
+
                 cat_id = int(category_sel.split(" - ", 1)[0]) if category_sel != "(Sem categoria)" else None
                 cc_id = int(cost_center_sel.split(" - ", 1)[0]) if cost_center_sel != "(Sem centro de custo)" else None
                 cli_id = int(client_sel.split(" - ", 1)[0]) if client_sel != "(Sem cliente)" else None
@@ -1889,6 +1924,11 @@ def add_transaction_ui(SessionLocal):
                                 reference=reference.strip() or None,
                                 notes=notes.strip() or None,
                             )
+                            # Anexa os mesmos arquivos aos dois registros da transferência
+                            if uploaded_payloads:
+                                _save_attachments_for(int(tx_out_id))
+                                _save_attachments_for(int(tx_in_id))
+
                             audit(session, "CREATE", "transactions", tx_out_id, None, {"transfer": True})
                             audit(session, "CREATE", "transactions", tx_in_id, None, {"transfer": True})
                             session.commit()
@@ -1959,6 +1999,17 @@ def add_transaction_ui(SessionLocal):
 
         st.caption(f"Mostrando {len(filtered)} registros (limite interno 3000).")
 
+        # Contagem de anexos por movimentação (para exibir na tabela)
+        att_count = {}
+        if filtered:
+            ids = [int(t.id) for t in filtered if getattr(t, "id", None) is not None]
+            if ids:
+                try:
+                    q_att = session.query(Attachment.transaction_id, func.count(Attachment.id)).filter(Attachment.transaction_id.in_(ids)).group_by(Attachment.transaction_id).all()
+                    att_count = {int(tid): int(cnt) for tid, cnt in q_att}
+                except Exception:
+                    att_count = {}
+
         rows = []
         for t in filtered:
             rows.append({
@@ -1977,6 +2028,7 @@ def add_transaction_ui(SessionLocal):
                 "Cliente": t.client.name if t.client else "",
                 "Fornecedor": t.supplier.name if t.supplier else "",
                 "Ref": t.reference or "",
+                "Anexos": int(att_count.get(int(t.id), 0)),
                 "Transfer?": "Sim" if t.is_transfer else "Não",
                 "Grupo Recorrência": t.recurrence_group or "",
             })
