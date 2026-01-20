@@ -60,8 +60,21 @@ def get_finance_db() -> Tuple[object, object]:
     return bk_finance.get_db()
 
 
-def ensure_erp_tables() -> None:
-    engine, _ = get_finance_db()
+def ensure_erp_tables(engine=None, *_, **__) -> None:
+    """Garante as tabelas base do ERP.
+
+    Compatibilidade:
+    - Algumas paginas antigas chamam `ensure_erp_tables(engine)`.
+    - Outras chamam `ensure_erp_tables()`.
+
+    Este helper aceita ambos para evitar `TypeError` em producao.
+    """
+
+    if engine is None:
+    # Se nao veio engine (chamada nova), usa o engine padrao do Financeiro.
+    # Se veio, reutiliza o mesmo engine para evitar conexoes duplicadas.
+    if engine is None:
+        engine, _ = get_finance_db()
     dialect = engine.dialect.name
 
     # Tipos por dialeto
