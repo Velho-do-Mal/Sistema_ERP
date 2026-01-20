@@ -47,6 +47,97 @@ def _table_exists(engine, table_name: str) -> bool:
             return False
 
 
+def _get_table_columns(engine, table_name: str) -> set[str]:
+    """Retorna o conjunto de colunas existentes (Postgres ou SQLite)."""
+    cols: set[str] = set()
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = :t
+                """
+            ), {"t": table_name}).fetchall()
+        cols = {str(r[0]) for r in rows}
+        if cols:
+            return cols
+    except Exception:
+        pass
+
+    # SQLite / fallback
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+        cols = {str(r[1]) for r in rows}
+    except Exception:
+        cols = set()
+    return cols
+
+
+def ensure_material_stock_schema(engine) -> None:
+    """Garante que a tabela material_stock tenha colunas esperadas (migração leve)."""
+    if not _table_exists(engine, "material_stock"):
+        return
+
+    cols = _get_table_columns(engine, "material_stock")
+
+    is_pg = (getattr(engine.dialect, "name", "") or "").startswith("postgres")
+    T_INT = "integer" if is_pg else "INTEGER"
+    T_NUM = "double precision" if is_pg else "REAL"
+    T_TXT = "text" if is_pg else "TEXT"
+    T_DATE = "date" if is_pg else "DATE"
+    T_TS = "timestamp" if is_pg else "TIMESTAMP"
+
+    wanted: list[tuple[str, str]] = [
+        ("material_code", T_TXT),
+        ("description", T_TXT),
+        ("supplier_id", T_INT),
+        ("project_id", T_INT),
+        ("qty_purchased", T_NUM),
+        ("qty_used", T_NUM),
+        ("unit_price", T_NUM),
+        ("total_price", T_NUM),
+        ("purchase_date", T_DATE),
+        ("validity_date", T_DATE),
+        ("notes", T_TXT),
+        ("supplier_name", T_TXT),
+        ("project_name", T_TXT),
+        ("created_at", T_TS),
+        ("updated_at", T_TS),
+    ]
+
+    with engine.begin() as conn:
+        for col, typ in wanted:
+            if col in cols:
+                continue
+            try:
+                if is_pg:
+                    conn.execute(text(f"ALTER TABLE material_stock ADD COLUMN IF NOT EXISTS {col} {typ}"))
+                else:
+                    conn.execute(text(f"ALTER TABLE material_stock ADD COLUMN {col} {typ}"))
+            except Exception:
+                pass
+
+        # Backfill unit_price a partir do total_price
+        try:
+            cols2 = _get_table_columns(engine, "material_stock")
+            if ("unit_price" in cols2) and ("total_price" in cols2):
+                conn.execute(text(
+                    """
+                    UPDATE material_stock
+                    SET unit_price = CASE
+                        WHEN (unit_price IS NULL OR unit_price = 0)
+                             AND qty_purchased IS NOT NULL AND qty_purchased <> 0
+                        THEN COALESCE(total_price, 0) / qty_purchased
+                        ELSE unit_price
+                    END
+                    """
+                ))
+        except Exception:
+            pass
+
+
 def load_suppliers(engine) -> pd.DataFrame:
     if not _table_exists(engine, "suppliers"):
         return pd.DataFrame(columns=["id", "name"])
@@ -66,43 +157,84 @@ def load_projects(engine) -> pd.DataFrame:
 
 
 def load_stock(engine) -> pd.DataFrame:
-    """Carrega a tabela de estoque (material_stock) já com nomes de fornecedor/projeto.
+    """Carrega o estoque de forma tolerante a versões diferentes do schema."""
+    if not _table_exists(engine, "material_stock"):
+        return pd.DataFrame()
 
-    A tabela `material_stock` é criada no `ensure_erp_tables` (bk_erp_shared.erp_db)
-    com as chaves `supplier_id` e `project_id`.
-    """
-    sql = """
+    ensure_material_stock_schema(engine)
+
+    cols = _get_table_columns(engine, "material_stock")
+    has_supplier_id = "supplier_id" in cols
+    has_project_id = "project_id" in cols
+    has_supplier_name = "supplier_name" in cols
+    has_project_name = "project_name" in cols
+
+    joins: list[str] = []
+    supplier_name_expr = "''"
+    project_name_expr = "''"
+
+    if has_supplier_id and _table_exists(engine, "suppliers"):
+        joins.append("LEFT JOIN suppliers s ON s.id = ms.supplier_id")
+        supplier_name_expr = "COALESCE(s.name, '')"
+    elif has_supplier_name:
+        supplier_name_expr = "COALESCE(ms.supplier_name, '')"
+
+    if has_project_id and _table_exists(engine, "projects"):
+        joins.append("LEFT JOIN projects p ON p.id = ms.project_id")
+        project_name_expr = "COALESCE(p.nome, COALESCE(p.name, ''))"
+    elif has_project_name:
+        project_name_expr = "COALESCE(ms.project_name, '')"
+
+    if "unit_price" in cols:
+        unit_price_expr = "COALESCE(ms.unit_price, 0)"
+    elif "total_price" in cols:
+        unit_price_expr = """CASE
+            WHEN ms.qty_purchased IS NOT NULL AND ms.qty_purchased <> 0
+            THEN COALESCE(ms.total_price, 0) / ms.qty_purchased
+            ELSE 0
+        END"""
+    else:
+        unit_price_expr = "0"
+
+    if "total_price" in cols:
+        total_price_expr = "COALESCE(ms.total_price, 0)"
+    elif "unit_price" in cols:
+        total_price_expr = "COALESCE(ms.unit_price, 0) * COALESCE(ms.qty_purchased, 0)"
+    else:
+        total_price_expr = "0"
+
+    sql = f"""
         SELECT
             ms.id,
             ms.material_code,
             ms.description,
-            COALESCE(s.name, '') AS supplier_name,
-            COALESCE(p.nome, '') AS project_name,
-            ms.supplier_id,
-            ms.project_id,
-            ms.qty_purchased,
+            {supplier_name_expr} AS supplier_name,
+            {project_name_expr} AS project_name,
+            {('ms.supplier_id' if has_supplier_id else 'NULL')} AS supplier_id,
+            {('ms.project_id' if has_project_id else 'NULL')} AS project_id,
+            COALESCE(ms.qty_purchased, 0) AS qty_purchased,
             COALESCE(ms.qty_used, 0) AS qty_used,
-            COALESCE(ms.unit_price, 0) AS unit_price,
-            COALESCE(ms.total_price, 0) AS total_price,
+            {unit_price_expr} AS unit_price,
+            {total_price_expr} AS total_price,
             ms.purchase_date,
             ms.validity_date,
             COALESCE(ms.notes, '') AS notes
         FROM material_stock ms
-        LEFT JOIN suppliers s ON s.id = ms.supplier_id
-        LEFT JOIN projects  p ON p.id = ms.project_id
+        {' '.join(joins)}
         ORDER BY ms.purchase_date DESC NULLS LAST, ms.id DESC
     """
 
-    if engine.dialect.name == "sqlite":
+    if (getattr(engine.dialect, "name", "") or "").startswith("sqlite"):
         sql = sql.replace(" NULLS LAST", "")
 
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         df = pd.read_sql(text(sql), conn)
 
     for c in ["qty_purchased", "qty_used", "unit_price", "total_price"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
+    df["saldo"] = (df.get("qty_purchased", 0) - df.get("qty_used", 0)).astype(float)
     return df
 
 def get_material_by_id(engine, rid: int) -> dict | None:
@@ -263,6 +395,7 @@ def main():
 
     engine, SessionLocal = get_finance_db()
     ensure_erp_tables(engine)
+    ensure_material_stock_schema(engine)
 
     login_and_guard(SessionLocal)
 
