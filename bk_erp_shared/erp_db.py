@@ -70,10 +70,13 @@ def ensure_erp_tables(engine=None, *_, **__) -> None:
     Este helper aceita ambos para evitar `TypeError` em producao.
     """
 
+    # Compatibilidade entre chamadas antigas e novas:
+    # - Home.py chama ensure_erp_tables(engine)
+    # - Algumas paginas antigas chamavam ensure_erp_tables() sem passar engine
+    # - Em alguns pontos existiu chamada ensure_erp_tables(engine, SessionLocal)
+    #   (aceitamos *args/**kwargs para nao quebrar)
     if engine is None:
-    # Se nao veio engine (chamada nova), usa o engine padrao do Financeiro.
-    # Se veio, reutiliza o mesmo engine para evitar conexoes duplicadas.
-    if engine is None:
+        # Se nao veio engine, usa o engine padrao do Financeiro.
         engine, _ = get_finance_db()
     dialect = engine.dialect.name
 
