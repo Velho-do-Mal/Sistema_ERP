@@ -66,98 +66,52 @@ def load_projects(engine) -> pd.DataFrame:
 
 
 def load_stock(engine) -> pd.DataFrame:
-    # Tenta trazer nomes (se existirem), mas não falha se a tabela de fornecedores ainda não existir.
-    has_sup = _table_exists(engine, "suppliers")
-    has_proj = _table_exists(engine, "projects")
+    """Carrega a tabela de estoque (material_stock).
 
-    if has_sup and has_proj:
-        sql = """
-            SELECT
-                sm.id,
-                sm.material_code AS "Código",
-                sm.description   AS "Descrição",
-                COALESCE(s.name, '') AS "Fornecedor",
-                COALESCE(p.nome, '') AS "Projeto",
-                sm.qty_purchased AS "Qtd. Comprada",
-                sm.purchase_value AS "Valor da Compra",
-                sm.purchase_date AS "Data da Compra",
-                sm.validity_date AS "Validade",
-                COALESCE(sm.notes,'') AS "Observação",
-                COALESCE(sm.used_qty, 0) AS "Utilizado"
-            FROM stock_materials sm
-            LEFT JOIN suppliers s ON s.id = sm.supplier_id
-            LEFT JOIN projects p  ON p.id = sm.project_id
-            ORDER BY sm.id DESC
-        """
-    elif has_sup and not has_proj:
-        sql = """
-            SELECT
-                sm.id,
-                sm.material_code AS "Código",
-                sm.description   AS "Descrição",
-                COALESCE(s.name, '') AS "Fornecedor",
-                CAST(COALESCE(sm.project_id,0) AS TEXT) AS "Projeto",
-                sm.qty_purchased AS "Qtd. Comprada",
-                sm.purchase_value AS "Valor da Compra",
-                sm.purchase_date AS "Data da Compra",
-                sm.validity_date AS "Validade",
-                COALESCE(sm.notes,'') AS "Observação",
-                COALESCE(sm.used_qty, 0) AS "Utilizado"
-            FROM stock_materials sm
-            LEFT JOIN suppliers s ON s.id = sm.supplier_id
-            ORDER BY sm.id DESC
-        """
-    elif (not has_sup) and has_proj:
-        sql = """
-            SELECT
-                sm.id,
-                sm.material_code AS "Código",
-                sm.description   AS "Descrição",
-                CAST(COALESCE(sm.supplier_id,0) AS TEXT) AS "Fornecedor",
-                COALESCE(p.nome, '') AS "Projeto",
-                sm.qty_purchased AS "Qtd. Comprada",
-                sm.purchase_value AS "Valor da Compra",
-                sm.purchase_date AS "Data da Compra",
-                sm.validity_date AS "Validade",
-                COALESCE(sm.notes,'') AS "Observação",
-                COALESCE(sm.used_qty, 0) AS "Utilizado"
-            FROM stock_materials sm
-            LEFT JOIN projects p  ON p.id = sm.project_id
-            ORDER BY sm.id DESC
-        """
-    else:
-        sql = """
-            SELECT
-                sm.id,
-                sm.material_code AS "Código",
-                sm.description   AS "Descrição",
-                CAST(COALESCE(sm.supplier_id,0) AS TEXT) AS "Fornecedor",
-                CAST(COALESCE(sm.project_id,0) AS TEXT) AS "Projeto",
-                sm.qty_purchased AS "Qtd. Comprada",
-                sm.purchase_value AS "Valor da Compra",
-                sm.purchase_date AS "Data da Compra",
-                sm.validity_date AS "Validade",
-                COALESCE(sm.notes,'') AS "Observação",
-                COALESCE(sm.used_qty, 0) AS "Utilizado"
-            FROM stock_materials sm
-            ORDER BY sm.id DESC
-        """
+    A tabela **material_stock** é criada pelo `ensure_erp_tables` e é a mesma
+    alimentada automaticamente pelo módulo **Compras**. Por isso, ao registrar
+    uma compra, o item já aparece aqui automaticamente.
 
-    df = pd.read_sql(text(sql), engine)
+    Observação: nesta tabela guardamos `supplier_name` e `project_name` como texto.
+    """
+    sql = """
+        SELECT
+            id,
+            material_code,
+            description,
+            COALESCE(supplier_name, '') AS supplier_name,
+            COALESCE(project_name, '') AS project_name,
+            qty_purchased,
+            unit_price,
+            purchase_date,
+            validity_date,
+            COALESCE(notes, '') AS notes,
+            COALESCE(qty_used, 0) AS qty_used
+        FROM material_stock
+        ORDER BY purchase_date DESC NULLS LAST, id DESC
+    """
+    with engine.begin() as conn:
+        try:
+            df = pd.read_sql(text(sql), conn)
+        except Exception:
+            # SQLite não aceita NULLS LAST
+            sql2 = sql.replace(' NULLS LAST', '')
+            df = pd.read_sql(text(sql2), conn)
 
-    # saldo (calculado)
-    for col in ["Qtd. Comprada", "Utilizado", "Valor da Compra"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    df["Saldo"] = df["Qtd. Comprada"] - df["Utilizado"]
-
-    # Datas para exibição
-    for c in ["Data da Compra", "Validade"]:
+    # Normalizações para o editor/tabela
+    for c in ['qty_purchased', 'unit_price', 'qty_used']:
         if c in df.columns:
-            df[c] = df[c].apply(lambda x: str(x)[:10] if x else "")
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
     return df
+
+
+def get_material_by_id(engine, rid: int) -> dict | None:
+    """Retorna 1 material por ID (material_stock)."""
+    df = pd.read_sql(text("SELECT * FROM material_stock WHERE id = :id"), engine, params={"id": int(rid)})
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
 
 
 def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
@@ -169,10 +123,10 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
 
     material_code = (payload.get("material_code") or "").strip()
     description = (payload.get("description") or "").strip()
-    supplier_id = payload.get("supplier_id")
-    project_id = payload.get("project_id")
+    supplier_name = payload.get("supplier_name")
+    project_name = payload.get("project_name")
     qty = float(payload.get("qty_purchased") or 0.0)
-    val = float(payload.get("purchase_value") or 0.0)
+    val = float(payload.get("unit_price") or 0.0)
 
     if not material_code:
         return "Código do material é obrigatório.", None
@@ -186,13 +140,13 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
             conn.execute(
                 text(
                     """
-                    UPDATE stock_materials
+                    UPDATE material_stock
                     SET material_code=:material_code,
                         description=:description,
-                        supplier_id=:supplier_id,
-                        project_id=:project_id,
+                        supplier_name=:supplier_name,
+                        project_name=:project_name,
                         qty_purchased=:qty_purchased,
-                        purchase_value=:purchase_value,
+                        unit_price=:unit_price,
                         purchase_date=:purchase_date,
                         validity_date=:validity_date,
                         notes=:notes,
@@ -204,10 +158,10 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
                     "id": int(edit_id),
                     "material_code": material_code,
                     "description": description,
-                    "supplier_id": supplier_id,
-                    "project_id": project_id,
+                    "supplier_name": supplier_name,
+                    "project_name": project_name,
                     "qty_purchased": qty,
-                    "purchase_value": val,
+                    "unit_price": val,
                     "purchase_date": payload.get("purchase_date"),
                     "validity_date": payload.get("validity_date"),
                     "notes": payload.get("notes"),
@@ -219,12 +173,12 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
         existing = conn.execute(
             text(
                 """
-                SELECT id, qty_purchased, COALESCE(used_qty,0) AS used_qty
-                FROM stock_materials
+                SELECT id, qty_purchased, COALESCE(qty_used,0) AS qty_used
+                FROM material_stock
                 WHERE material_code=:material_code
                   AND COALESCE(description,'')=:description
-                  AND COALESCE(supplier_id,0)=COALESCE(:supplier_id,0)
-                  AND COALESCE(project_id,0)=COALESCE(:project_id,0)
+                  AND COALESCE(supplier_name,'')=COALESCE(:supplier_name,'')
+                  AND COALESCE(project_name,'')=COALESCE(:project_name,'')
                 ORDER BY id DESC
                 LIMIT 1
                 """
@@ -232,8 +186,8 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
             {
                 "material_code": material_code,
                 "description": description,
-                "supplier_id": supplier_id,
-                "project_id": project_id,
+                "supplier_name": supplier_name,
+                "project_name": project_name,
             },
         ).fetchone()
 
@@ -244,9 +198,9 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
                 conn.execute(
                     text(
                         """
-                        UPDATE stock_materials
+                        UPDATE material_stock
                         SET qty_purchased = COALESCE(qty_purchased,0) + :add_qty,
-                            purchase_value = COALESCE(purchase_value,0) + :add_val,
+                            unit_price = COALESCE(unit_price,0) + :add_val,
                             purchase_date = COALESCE(:purchase_date, purchase_date),
                             validity_date = COALESCE(:validity_date, validity_date),
                             notes = CASE
@@ -273,13 +227,13 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
         new_id = conn.execute(
             text(
                 """
-                INSERT INTO stock_materials
-                    (material_code, description, supplier_id, project_id,
-                     qty_purchased, purchase_value, purchase_date, validity_date,
-                     notes, used_qty, created_at, updated_at)
+                INSERT INTO material_stock
+                    (material_code, description, supplier_name, project_name,
+                     qty_purchased, unit_price, purchase_date, validity_date,
+                     notes, qty_used, created_at, updated_at)
                 VALUES
-                    (:material_code, :description, :supplier_id, :project_id,
-                     :qty_purchased, :purchase_value, :purchase_date, :validity_date,
+                    (:material_code, :description, :supplier_name, :project_name,
+                     :qty_purchased, :unit_price, :purchase_date, :validity_date,
                      :notes, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 RETURNING id
                 """
@@ -287,10 +241,10 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
             {
                 "material_code": material_code,
                 "description": description,
-                "supplier_id": supplier_id,
-                "project_id": project_id,
+                "supplier_name": supplier_name,
+                "project_name": project_name,
                 "qty_purchased": qty,
-                "purchase_value": val,
+                "unit_price": val,
                 "purchase_date": payload.get("purchase_date"),
                 "validity_date": payload.get("validity_date"),
                 "notes": payload.get("notes"),
@@ -302,7 +256,7 @@ def upsert_purchase(engine, payload: dict) -> tuple[str, int | None]:
 
 def delete_material(engine, rid: int) -> bool:
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM stock_materials WHERE id=:id"), {"id": int(rid)})
+        conn.execute(text("DELETE FROM material_stock WHERE id=:id"), {"id": int(rid)})
     return True
 
 
@@ -314,13 +268,13 @@ def update_used_qty(engine, updates: list[dict]) -> int:
             conn.execute(
                 text(
                     """
-                    UPDATE stock_materials
-                    SET used_qty=:used_qty,
+                    UPDATE material_stock
+                    SET qty_used=:qty_used,
                         updated_at=CURRENT_TIMESTAMP
                     WHERE id=:id
                     """
                 ),
-                {"id": int(u["id"]), "used_qty": float(u["used_qty"])},
+                {"id": int(u["id"]), "qty_used": float(u["qty_used"])},
             )
     return len(updates)
 
@@ -336,7 +290,7 @@ def main():
     st.title("📦 Estoque de Materiais")
     st.caption("Cadastro de compras, controle de utilização e saldo")
 
-    if not _table_exists(engine, "stock_materials"):
+    if not _table_exists(engine, "material_stock"):
         st.error("Tabela de estoque ainda não existe. (ensure_erp_tables não criou)")
         st.stop()
 
@@ -350,7 +304,7 @@ def main():
     # --- Formulário ---
     st.subheader("Cadastro / Edição")
 
-    df_stock_raw = pd.read_sql(text("SELECT id, material_code, description FROM stock_materials ORDER BY id DESC"), engine)
+    df_stock_raw = pd.read_sql(text("SELECT id, material_code, description FROM material_stock ORDER BY id DESC"), engine)
     edit_choices = ["(Novo)"] + [f"{int(r.id)} - {r.material_code} - {r.description}" for r in df_stock_raw.itertuples(index=False)]
 
     sel = st.selectbox("Selecionar material para editar", edit_choices, index=0)
@@ -362,10 +316,10 @@ def main():
     current = {
         "material_code": "",
         "description": "",
-        "supplier_id": None,
-        "project_id": None,
+        "supplier_name": None,
+        "project_name": None,
         "qty_purchased": 0.0,
-        "purchase_value": 0.0,
+        "unit_price": 0.0,
         "purchase_date": date.today(),
         "validity_date": None,
         "notes": "",
@@ -375,9 +329,9 @@ def main():
         row = pd.read_sql(
             text(
                 """
-                SELECT id, material_code, description, supplier_id, project_id,
-                       qty_purchased, purchase_value, purchase_date, validity_date, notes
-                FROM stock_materials
+                SELECT id, material_code, description, supplier_name, project_name,
+                       qty_purchased, unit_price, purchase_date, validity_date, notes
+                FROM material_stock
                 WHERE id=:id
                 """
             ),
@@ -390,22 +344,21 @@ def main():
                 {
                     "material_code": r.get("material_code") or "",
                     "description": r.get("description") or "",
-                    "supplier_id": r.get("supplier_id"),
-                    "project_id": r.get("project_id"),
+                    "supplier_name": r.get("supplier_name"),
+                    "project_name": r.get("project_name"),
                     "qty_purchased": float(r.get("qty_purchased") or 0.0),
-                    "purchase_value": float(r.get("purchase_value") or 0.0),
+                    "unit_price": float(r.get("unit_price") or 0.0),
                     "purchase_date": _from_iso(r.get("purchase_date")) or date.today(),
                     "validity_date": _from_iso(r.get("validity_date")),
                     "notes": r.get("notes") or "",
                 }
             )
-
     # Indexes selects
-    def _idx_from_id(opts: list[str], target_id: int | None) -> int:
-        if not target_id:
+    def _idx_from_name(opts: list[str], target_name: str | None) -> int:
+        if not target_name:
             return 0
         for i, o in enumerate(opts):
-            if o.startswith(f"{int(target_id)} - "):
+            if ' - ' in o and o.split(' - ', 1)[1].strip() == str(target_name).strip():
                 return i
         return 0
 
@@ -420,20 +373,20 @@ def main():
             supplier_sel = st.selectbox(
                 "Fornecedor",
                 options=sup_opts,
-                index=_idx_from_id(sup_opts, current.get("supplier_id")),
+                index=_idx_from_name(sup_opts, current.get("supplier_name")),
             )
         with c4:
             project_sel = st.selectbox(
                 "Projeto",
                 options=proj_opts,
-                index=_idx_from_id(proj_opts, current.get("project_id")),
+                index=_idx_from_name(proj_opts, current.get("project_name")),
             )
 
         c5, c6, c7, c8 = st.columns(4)
         with c5:
             qty_purchased = st.number_input("Quantidade comprada *", min_value=0.0, value=float(current["qty_purchased"]), step=1.0)
         with c6:
-            purchase_value = st.number_input("Valor da compra", min_value=0.0, value=float(current["purchase_value"]), step=50.0)
+            unit_price = st.number_input("Valor da compra", min_value=0.0, value=float(current["unit_price"]), step=50.0)
         with c7:
             purchase_date = st.date_input("Data da compra", value=current["purchase_date"])
         with c8:
@@ -469,17 +422,17 @@ def main():
 
     if btn_save:
         try:
-            supplier_id = int(supplier_sel.split(" - ", 1)[0]) if supplier_sel != "(Sem fornecedor)" else None
-            project_id = int(project_sel.split(" - ", 1)[0]) if project_sel != "(Sem projeto)" else None
+            supplier_name = supplier_sel.split(" - ", 1)[1] if (supplier_sel and supplier_sel != "(Sem fornecedor)" and " - " in supplier_sel) else None
+            project_name = project_sel.split(" - ", 1)[1] if (project_sel and project_sel != "(Sem projeto)" and " - " in project_sel) else None
 
             payload = {
                 "id": int(edit_id) if edit_id > 0 else None,
                 "material_code": material_code,
                 "description": description,
-                "supplier_id": supplier_id,
-                "project_id": project_id,
+                "supplier_name": supplier_name,
+                "project_name": project_name,
                 "qty_purchased": float(qty_purchased),
-                "purchase_value": float(purchase_value),
+                "unit_price": float(unit_price),
                 "purchase_date": _to_iso(purchase_date),
                 "validity_date": _to_iso(validity_date) if use_validity else None,
                 "notes": notes.strip() or None,
@@ -502,26 +455,29 @@ def main():
         st.info("Nenhum material cadastrado.")
         return
 
-    # Editor: somente Utilizado editável
-    df_editor = df.copy()
+    # Editor: somente **Utilizado** editável
+    df_editor = pd.DataFrame({
+        "id": df["id"],
+        "Código": df["material_code"],
+        "Descrição": df["description"],
+        "Fornecedor": df.get("supplier_name", ""),
+        "Projeto": df.get("project_name", ""),
+        "Qtd. Comprada": pd.to_numeric(df.get("qty_purchased", 0), errors="coerce").fillna(0.0),
+        "Valor da Compra": pd.to_numeric(df.get("unit_price", 0), errors="coerce").fillna(0.0),
+        "Data da Compra": df.get("purchase_date", ""),
+        "Validade": df.get("validity_date", ""),
+        "Observação": df.get("notes", ""),
+        "Utilizado": pd.to_numeric(df.get("qty_used", 0), errors="coerce").fillna(0.0),
+    })
+    df_editor["Saldo"] = df_editor["Qtd. Comprada"] - df_editor["Utilizado"]
+
+    disabled_cols = [c for c in df_editor.columns if c != "Utilizado"]
 
     edited = st.data_editor(
         df_editor,
         hide_index=True,
         width="stretch",
-        disabled=[
-            "id",
-            "Código",
-            "Descrição",
-            "Fornecedor",
-            "Projeto",
-            "Qtd. Comprada",
-            "Valor da Compra",
-            "Data da Compra",
-            "Validade",
-            "Observação",
-            "Saldo",
-        ],
+        disabled=disabled_cols,
         key="stock_editor",
     )
 
@@ -529,13 +485,14 @@ def main():
         # detecta alterações
         updates: list[dict] = []
         try:
-            base_map = {int(r.id): float(r["Utilizado"]) for _, r in df.iterrows()}
+            base_map = {int(r["id"]): float((r.get("qty_used") or 0) if (r.get("qty_used") is not None) else 0) for _, r in df.iterrows()}
             for _, r in edited.iterrows():
                 rid = int(r["id"])
-                new_u = float(pd.to_numeric(r["Utilizado"], errors="coerce") or 0.0)
+                val_u = pd.to_numeric(r["Utilizado"], errors="coerce")
+                new_u = 0.0 if pd.isna(val_u) else float(val_u)
                 old_u = float(base_map.get(rid, 0.0))
                 if abs(new_u - old_u) > 1e-9:
-                    updates.append({"id": rid, "used_qty": max(new_u, 0.0)})
+                    updates.append({"id": rid, "qty_used": max(new_u, 0.0)})
 
             n = update_used_qty(engine, updates)
             st.success(f"Atualizado: {n} item(ns).")
