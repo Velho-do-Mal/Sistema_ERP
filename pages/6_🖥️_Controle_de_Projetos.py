@@ -687,9 +687,9 @@ def _build_report_html(meta: Dict, tasks_df: pd.DataFrame, metrics_df: pd.DataFr
         "status",
         "observation",
         # opcional: métricas calculadas (se quiser no relatório)
-        "dias_BK",
-        "dias_CLIENTE",
-        "revisoes",
+       # "dias_BK",
+        #"dias_CLIENTE",
+        # "revisoes",
     ]
 
     cols = [c for c in desired if c in out_show.columns]
