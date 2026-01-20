@@ -250,6 +250,29 @@ def ensure_erp_tables() -> None:
             notes TEXT
         );
         """,
+
+        # -------------------------
+        # ESTOQUE DE MATERIAIS
+        # (sem FK para não depender da ordem de criação de tabelas externas)
+        # -------------------------
+        f"""
+        CREATE TABLE IF NOT EXISTS material_stock (
+            id {id_col},
+            material_code TEXT NOT NULL,
+            description TEXT,
+            supplier_id INTEGER NULL,
+            project_id INTEGER NULL,
+            qty_purchased {money} DEFAULT 0,
+            purchase_value {money} DEFAULT 0,
+            purchase_date TEXT,
+            validity_date TEXT,
+            notes TEXT,
+            qty_used {money} DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        );
+        """,
+
         # -------------------------
         # DOCUMENTOS (anexos gerais)
         # -------------------------
