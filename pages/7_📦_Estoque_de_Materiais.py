@@ -181,7 +181,18 @@ def load_stock(engine) -> pd.DataFrame:
 
     if has_project_id and _table_exists(engine, "projects"):
         joins.append("LEFT JOIN projects p ON p.id = ms.project_id")
-        project_name_expr = "COALESCE(p.nome, COALESCE(p.name, ''))"
+        # IMPORTANTE: não referenciar colunas que não existem.
+        # No seu schema, a coluna costuma ser `nome` (PT-BR). Alguns exemplos antigos usam `name`.
+        # Referenciar uma coluna inexistente (mesmo dentro de COALESCE) quebra no Postgres.
+        pcols = _get_table_columns(engine, "projects")
+        if "nome" in pcols:
+            project_name_expr = "COALESCE(p.nome, '')"
+        elif "name" in pcols:
+            project_name_expr = "COALESCE(p.name, '')"
+        elif "project_name" in pcols:
+            project_name_expr = "COALESCE(p.project_name, '')"
+        else:
+            project_name_expr = "''"
     elif has_project_name:
         project_name_expr = "COALESCE(ms.project_name, '')"
 
