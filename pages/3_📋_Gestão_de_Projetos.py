@@ -273,6 +273,39 @@ def delete_project(project_id: int):
 # CPM / GANTT / CURVA S TRABALHO
 # --------------------------------------------------------
 
+
+
+def parse_predecessores(raw) -> list[str]:
+    """Parse campo de predecessoras.
+
+    Aceita string '1, 2.1' ou lista já pronta.
+    Retorna lista de códigos não vazios.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    s = str(raw).strip()
+    if not s:
+        return []
+    # separa por vírgula e ponto-e-vírgula
+    parts = [p.strip() for p in s.replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
+
+def compute_is_summary(tasks: list[dict]) -> dict[str, bool]:
+    """Define se uma tarefa é resumo (possui filhos) baseado no código (1.2.3)."""
+    codes = [str(t.get("codigo", "")).strip() for t in tasks if str(t.get("codigo", "")).strip()]
+    is_summary: dict[str, bool] = {c: False for c in codes}
+    code_set = set(codes)
+    for c in codes:
+        prefix = c + "."
+        # se existir qualquer outro código com este prefixo => é resumo
+        if any((other != c and other.startswith(prefix)) for other in code_set):
+            is_summary[c] = True
+    return is_summary
+
+
 def calcular_cpm(tasks):
     """
     Calcula ES/EF/LS/LF (em dias corridos) com base em predecessoras (padrão FS)
@@ -499,23 +532,135 @@ def gerar_curva_s_trabalho(tasks, data_inicio_str):
     return fig
 
 
+
+def calcular_datas_eap(tasks, data_inicio_projeto=None):
+    """Calcula Data de Início/Conclusão por tarefa (MS Project simplificado)."""
+    if not tasks:
+        return []
+
+    from datetime import date, datetime, timedelta
+
+    if data_inicio_projeto is None:
+        starts = []
+        for t in tasks:
+            try:
+                if t.get("data_inicio"):
+                    starts.append(datetime.strptime(str(t["data_inicio"]), "%Y-%m-%d").date())
+            except Exception:
+                pass
+        data_inicio_projeto = min(starts) if starts else date.today()
+
+    tmap = {str(t.get("codigo")): dict(t) for t in tasks if t.get("codigo")}
+    # garante flag de tarefa-resumo (quando não existe na base)
+    _is_summary = compute_is_summary(list(tmap.values()))
+    for _c, _t in tmap.items():
+        if "is_summary" not in _t or _t.get("is_summary") is None:
+            _t["is_summary"] = bool(_is_summary.get(_c, False))
+
+    preds_map = {}
+    for cod, t in tmap.items():
+        preds = parse_predecessores(t.get("predecessoras", ""))
+        preds_map[cod] = [p for p in preds if p in tmap]
+
+    scheduled = {}
+
+    def manual_start(task):
+        try:
+            if task.get("data_inicio"):
+                return datetime.strptime(str(task["data_inicio"]), "%Y-%m-%d").date()
+        except Exception:
+            pass
+        return data_inicio_projeto
+
+    pending = {c for c, t in tmap.items() if not t.get("is_summary")}
+    guard = 0
+    while pending and guard < 10000:
+        guard += 1
+        progressed = False
+        for cod in list(pending):
+            preds = preds_map.get(cod, [])
+            if any(p not in scheduled for p in preds):
+                continue
+
+            task = tmap[cod]
+            rel = (task.get("relacao") or "FS").strip().upper()
+            dur = int(task.get("duracao") or 0)
+
+            min_start = data_inicio_projeto
+            if preds:
+                if rel == "SS":
+                    min_start = max(scheduled[p]["start"] for p in preds)
+                elif rel == "FF":
+                    min_finish = max(scheduled[p]["finish"] for p in preds)
+                    min_start = min_finish - timedelta(days=dur)
+                elif rel == "SF":
+                    min_finish = max(scheduled[p]["start"] for p in preds)
+                    min_start = min_finish - timedelta(days=dur)
+                else:  # FS
+                    min_start = max(scheduled[p]["finish"] for p in preds)
+
+            start = max(min_start, manual_start(task))
+            finish = start + timedelta(days=dur)
+
+            scheduled[cod] = {"start": start, "finish": finish}
+            pending.remove(cod)
+            progressed = True
+
+        if not progressed:
+            for cod in list(pending):
+                task = tmap[cod]
+                dur = int(task.get("duracao") or 0)
+                start = manual_start(task)
+                scheduled[cod] = {"start": start, "finish": start + timedelta(days=dur)}
+                pending.remove(cod)
+
+    # resumo por hierarquia de código (prefixo)
+    for cod, task in tmap.items():
+        if not task.get("is_summary"):
+            continue
+        prefix = cod + "."
+        childs = [c for c in scheduled.keys() if str(c).startswith(prefix)]
+        if childs:
+            start = min(scheduled[c]["start"] for c in childs)
+            finish = max(scheduled[c]["finish"] for c in childs)
+        else:
+            dur = int(task.get("duracao") or 0)
+            start = manual_start(task)
+            finish = start + timedelta(days=dur)
+        scheduled[cod] = {"start": start, "finish": finish}
+
+    out = []
+    for t in tasks:
+        cod = str(t.get("codigo"))
+        rec = dict(t)
+        if cod in scheduled:
+            rec["data_inicio_calc"] = scheduled[cod]["start"].isoformat()
+            rec["data_conclusao_calc"] = scheduled[cod]["finish"].isoformat()
+        out.append(rec)
+    return out
+
+
 def gerar_gantt(tasks, data_inicio_str):
     """
     Gera um gráfico de Gantt simplificado a partir das tarefas (usa es/ef gerados pelo CPM).
     """
     if not tasks or not data_inicio_str:
         return None
-    tasks_cpm, projeto_fim = calcular_cpm(tasks)
+    tasks_sched = calcular_datas_eap(tasks, None)
     try:
         data_inicio_dt = datetime.strptime(data_inicio_str, "%Y-%m-%d").date()
     except Exception:
         return None
     rows = []
-    for t in tasks_cpm:
-        es = int(t.get("es", 0))
-        ef = int(t.get("ef", 0))
-        start = data_inicio_dt + timedelta(days=es)
-        finish = data_inicio_dt + timedelta(days=ef)
+    for t in tasks_sched:
+        try:
+            start = datetime.strptime(str(t.get('data_inicio_calc') or t.get('data_inicio')), '%Y-%m-%d').date()
+        except Exception:
+            start = data_inicio_dt
+        try:
+            finish = datetime.strptime(str(t.get('data_conclusao_calc') or t.get('data_conclusao')), '%Y-%m-%d').date()
+        except Exception:
+            finish = start
         rows.append(
             {
                 "Task": f"{t.get('codigo')} - {t.get('descricao')}",
@@ -914,7 +1059,7 @@ with tabs[0]:
                 tasks_cpm, _ = calcular_cpm(eapTasks)
                 data_inicio_dt = datetime.strptime(tap["dataInicio"], "%Y-%m-%d").date()
                 hoje = date.today()
-                for t in tasks_cpm:
+                for t in tasks_sched:
                     status_t = t.get("status", "nao-iniciado")
                     if status_t != "concluido":
                         ef_dia = t.get("ef", 0)
@@ -1109,6 +1254,22 @@ with tabs[2]:
             duracao = st.number_input(
                 "Duração (dias)", min_value=1, value=1, key="eap_dur"
             )
+
+        # Datas (Início e Conclusão) - Conclusão = Início + Duração
+        col_dt1, col_dt2 = st.columns([1.6, 1.6])
+        data_inicio = col_dt1.date_input("Data de Início", value=date.today(), key="eap_data_inicio")
+        try:
+            _dur = int(duracao or 0)
+        except Exception:
+            _dur = 0
+        data_conclusao = data_inicio + timedelta(days=_dur)
+        col_dt2.text_input(
+            "Data de Conclusão (automática)",
+            value=data_conclusao.strftime("%Y-%m-%d"),
+            disabled=True,
+            key="eap_data_conclusao",
+            help="Calculada como Data de Início + Duração (dias).",
+        )
         with c4:
             responsavel = st.text_input("Responsável", key="eap_resp")
 
@@ -1143,6 +1304,8 @@ with tabs[2]:
                         "predecessoras": preds,
                         "responsavel": responsavel.strip(),
                         "duracao": int(duracao),
+                "data_inicio": data_inicio.isoformat() if data_inicio else "",
+                "data_conclusao": data_conclusao.isoformat() if data_conclusao else "",
                         "relacao": relacao,
                         "status": status,
                     }
@@ -1155,7 +1318,12 @@ with tabs[2]:
         st.markdown("#### Tabela de atividades da EAP")
 
         # Indentação conforme nível (1..4) - usando NBSP para preservar espaços
-        df_eap = pd.DataFrame(eapTasks)
+        tasks_for_table = calcular_datas_eap(eapTasks, None)
+        df_eap = pd.DataFrame(tasks_for_table)
+        if 'data_inicio_calc' in df_eap.columns:
+            df_eap['data_inicio'] = df_eap['data_inicio_calc']
+            df_eap['data_conclusao'] = df_eap['data_conclusao_calc']
+            df_eap.drop(columns=[c for c in ['data_inicio_calc','data_conclusao_calc'] if c in df_eap.columns], inplace=True)
         df_eap_sorted = df_eap.sort_values(by="codigo")
         df_eap_display = df_eap_sorted.copy()
         def indent_desc(row):
@@ -1206,6 +1374,26 @@ with tabs[2]:
                     min_value=1,
                     value=int(tarefa_sel.get("duracao", 1)),
                     key="eap_edit_dur"
+                )
+
+                # Datas (Início e Conclusão) - Conclusão = Início + Duração
+                try:
+                    _ini_val = datetime.strptime(str(tarefa_sel.get("data_inicio", "")), "%Y-%m-%d").date()
+                except Exception:
+                    _ini_val = date.today()
+                col_dte1, col_dte2 = st.columns([1.6, 1.6])
+                data_inicio_edit = col_dte1.date_input("Data de Início", value=_ini_val, key="eap_data_inicio_edit")
+                try:
+                    _dur_e = int(dur_edit or 0)
+                except Exception:
+                    _dur_e = 0
+                data_conclusao_edit = data_inicio_edit + timedelta(days=_dur_e)
+                col_dte2.text_input(
+                    "Data de Conclusão (automática)",
+                    value=data_conclusao_edit.strftime("%Y-%m-%d"),
+                    disabled=True,
+                    key="eap_data_conclusao_edit",
+                    help="Calculada como Data de Início + Duração (dias).",
                 )
             with ce4:
                 resp_edit = st.text_input(
@@ -2520,7 +2708,7 @@ with tabs[8]:
                 data_inicio_dt = datetime.strptime(tap["dataInicio"], "%Y-%m-%d").date()
                 rows = []
                 hoje = date.today()
-                for t in tasks_cpm:
+                for t in tasks_sched:
                     es = int(t.get("es", 0))
                     ef = int(t.get("ef", 0))
                     start = data_inicio_dt + timedelta(days=es)
