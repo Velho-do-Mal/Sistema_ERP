@@ -521,8 +521,14 @@ def _upsert_doc_tasks(SessionLocal, engine, project_id: int, edited: pd.DataFram
     return inserted, updated, deleted
 
 
+
 def _compute_metrics(engine, project_id: int) -> pd.DataFrame:
-    """Calcula tempos BK x Cliente com base nos eventos."""
+    """Calcula tempos BK x Cliente e número de revisões (somente quando a letra da revisão sobe).
+
+    - dias_BK / dias_CLIENTE: calculados a partir do histórico de eventos.
+    - revisoes: conta somente incrementos alfabéticos do código de revisão (ex.: R0A -> R0B = 1).
+      O primeiro código encontrado não conta como revisão (é a "base").
+    """
     sql = text("""
         SELECT doc_task_id, event_date, status, responsible, COALESCE(revision_code,'') AS revision_code
         FROM doc_status_events
@@ -531,41 +537,55 @@ def _compute_metrics(engine, project_id: int) -> pd.DataFrame:
     """)
     with engine.connect() as conn:
         ev = pd.read_sql_query(sql, conn, params={"pid": int(project_id)})
+
     if ev.empty:
-        return pd.DataFrame(columns=["id","dias_BK","dias_CLIENTE","revisoes"])
+        return pd.DataFrame(columns=["id", "dias_BK", "dias_CLIENTE", "revisoes"])
 
     ev["event_date"] = pd.to_datetime(ev["event_date"], errors="coerce").dt.date
     today = date.today()
 
-    rows = []
+    def _rev_letter_ord(rev: str) -> Optional[int]:
+        r = (rev or "").strip().upper()
+        if len(r) >= 3 and r.startswith("R0"):
+            ch = r[2]
+            if "A" <= ch <= "Z":
+                return ord(ch)
+        return None
+
+    rows: List[Dict] = []
     for doc_id, g in ev.groupby("doc_task_id"):
-        g = g.sort_values("event_date")
+        g = g.sort_values(["event_date"])
         dias_bk = 0
         dias_cli = 0
+
+        # revisões: só conta quando a letra sobe (R0A->R0B, R0B->R0C, ...)
         revisoes = 0
-        # conta revisões: eventos em revisão ou revision_code diferente
-        last_rev = ""
+        last_letter: Optional[int] = None
+
         for i in range(len(g)):
             cur = g.iloc[i]
             cur_date = cur["event_date"] or today
-            cur_status = str(cur["status"] or "")
+            cur_status = str(cur.get("status") or "")
             cur_kind = _status_kind(cur_status)
-            cur_resp = str(cur["responsible"] or "")
+            cur_resp = str(cur.get("responsible") or "")
             cur_rev = str(cur.get("revision_code") or "")
 
-            if cur_kind == "revisao":
-                if cur_rev and cur_rev != last_rev:
-                    revisoes += 1
+            cur_letter = _rev_letter_ord(cur_rev)
+            if cur_letter is not None:
+                if last_letter is None:
+                    last_letter = cur_letter
                 else:
-                    # se não mudou código, ainda assim conta como uma revisão
-                    revisoes += 1
-            if cur_rev:
-                last_rev = cur_rev
+                    if cur_letter > last_letter:
+                        revisoes += 1
+                        last_letter = cur_letter
+                    elif cur_letter < last_letter:
+                        # se voltar, rebaseia (não conta como revisão)
+                        last_letter = cur_letter
 
+            # calcula intervalo até próximo evento (ou até hoje, se não aprovado)
             if i < len(g) - 1:
-                next_date = g.iloc[i+1]["event_date"] or today
+                next_date = g.iloc[i + 1]["event_date"] or today
             else:
-                # se aprovado, não conta até hoje
                 if cur_kind == "aprovado":
                     next_date = cur_date
                 else:
@@ -580,7 +600,14 @@ def _compute_metrics(engine, project_id: int) -> pd.DataFrame:
             else:
                 dias_bk += delta
 
-        rows.append({"id": int(doc_id), "dias_BK": dias_bk, "dias_CLIENTE": dias_cli, "revisoes": revisoes})
+        rows.append(
+            {
+                "id": int(doc_id),
+                "dias_BK": int(dias_bk),
+                "dias_CLIENTE": int(dias_cli),
+                "revisoes": int(revisoes),
+            }
+        )
 
     return pd.DataFrame(rows)
 
@@ -603,6 +630,70 @@ def _chart_png_b64(df: pd.DataFrame, x: str, y: str, title: str) -> str:
     except Exception:
         return ""
 
+
+def _pie_chart_png_b64(labels: List[str], values: List[int], title: str) -> str:
+    """Gera gráfico de pizza em PNG base64 (com cores diferentes por status)."""
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+
+        vals = [int(v) for v in values]
+        if sum(vals) <= 0:
+            return ""
+
+        cmap = cm.get_cmap("tab20", max(len(labels), 3))
+        colors = [cmap(i) for i in range(len(labels))]
+
+        fig = plt.figure(figsize=(7.2, 3.6))
+        ax = fig.add_subplot(111)
+        wedges, texts, autotexts = ax.pie(
+            vals,
+            labels=None,
+            autopct=lambda p: f"{p:.1f}%" if p > 0 else "",
+            startangle=90,
+            colors=colors,
+        )
+        ax.axis("equal")
+        ax.set_title(title)
+        ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False)
+        fig.tight_layout()
+
+        bio = BytesIO()
+        fig.savefig(bio, format="png", dpi=150)
+        plt.close(fig)
+        b64 = base64.b64encode(bio.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        return ""
+
+
+def _bk_cliente_bar_png_b64(bk_days: int, client_days: int, title: str) -> str:
+    """Gera gráfico de barras (BK x Cliente) com cores azul/vermelho e número em cima."""
+    try:
+        import matplotlib.pyplot as plt
+
+        labels = ["BK", "Cliente"]
+        vals = [int(bk_days), int(client_days)]
+        colors = ["blue", "red"]
+
+        fig = plt.figure(figsize=(6.2, 3.4))
+        ax = fig.add_subplot(111)
+        bars = ax.bar(labels, vals, color=colors)
+        ax.set_title(title)
+        ax.set_ylabel("Dias")
+
+        for b in bars:
+            h = b.get_height()
+            ax.text(b.get_x() + b.get_width() / 2, h, f"{int(h)}", ha="center", va="bottom", fontsize=10)
+
+        fig.tight_layout()
+        bio = BytesIO()
+        fig.savefig(bio, format="png", dpi=150)
+        plt.close(fig)
+        b64 = base64.b64encode(bio.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        return ""
 
 def _build_report_html(meta: Dict, tasks_df: pd.DataFrame, metrics_df: pd.DataFrame) -> str:
     """Monta HTML do relatório (padrão BK: bordas finas cinza claro + gráficos)."""
@@ -725,6 +816,144 @@ def _build_report_html(meta: Dict, tasks_df: pd.DataFrame, metrics_df: pd.DataFr
     html.append('</div>')
     html.append('</body></html>')
     return "\n".join(html)
+def _build_manager_report_html(meta: Dict, tasks_df: pd.DataFrame, metrics_df: pd.DataFrame) -> str:
+    """Relatório gerencial:
+    - Tabela: quantidade de documentos por status (cabeçalho = status; linha abaixo = quantidade).
+    - Gráfico de pizza: percentual por status (cores diferentes).
+    - Gráfico de barras: total de dias com BK vs Cliente (BK azul; Cliente vermelho; valor em cima).
+    - Tabela: quantas vezes o documento foi revisado (somente quando letra sobe).
+    - Botão para impressão (window.print).
+    """
+    cliente = meta.get("client_name") or "Cliente"
+    proj_nome = meta.get("project_name") or "Projeto"
+    proj_num = meta.get("project_number") or ""
+    proj_status = meta.get("project_status") or ""
+
+    logo_bk_uri = meta.get("logo_bk_uri") or ""
+    logo_cli_uri = meta.get("logo_client_uri") or ""
+
+    # status counts (preserva ordem conhecida, mas inclui outros se existirem)
+    counts = {}
+    if tasks_df is not None and not tasks_df.empty and "status" in tasks_df.columns:
+        vc = tasks_df["status"].fillna("").astype(str).value_counts()
+        for s in STATUS_OPTIONS:
+            if s in vc.index:
+                counts[s] = int(vc.loc[s])
+        # statuses extras (se houver)
+        for s in vc.index.tolist():
+            if s and s not in counts:
+                counts[s] = int(vc.loc[s])
+
+    labels = list(counts.keys())
+    values = list(counts.values())
+
+    status_table_html = ""
+    if labels:
+        df_counts = pd.DataFrame([values], columns=labels)
+        status_table_html = df_counts.to_html(index=False, escape=False)
+
+    # gráficos
+    pie_uri = _pie_chart_png_b64(labels, values, "Percentual de documentos por status") if labels else ""
+
+    bk_total = int(metrics_df["dias_BK"].sum()) if metrics_df is not None and not metrics_df.empty and "dias_BK" in metrics_df.columns else 0
+    cli_total = int(metrics_df["dias_CLIENTE"].sum()) if metrics_df is not None and not metrics_df.empty and "dias_CLIENTE" in metrics_df.columns else 0
+    bk_cli_uri = _bk_cliente_bar_png_b64(bk_total, cli_total, "Total de dias com BK x Cliente")
+
+    # tabela de revisões por documento
+    rev_table_html = "<p>Sem dados.</p>"
+    if tasks_df is not None and not tasks_df.empty:
+        df = tasks_df.copy()
+        if metrics_df is not None and not metrics_df.empty:
+            df = df.merge(metrics_df[["id", "revisoes"]], on="id", how="left")
+        df["revisoes"] = df.get("revisoes", 0)
+        df["revisoes"] = pd.to_numeric(df["revisoes"], errors="coerce").fillna(0).astype(int)
+
+        show_cols = []
+        for c in ["doc_name", "doc_number", "revision_code", "status", "revisoes"]:
+            if c in df.columns:
+                show_cols.append(c)
+        if show_cols:
+            df2 = df[show_cols].copy().rename(
+                columns={
+                    "doc_name": "NOME DO DOCUMENTO",
+                    "doc_number": "NUMERO DO DOCUMENTO",
+                    "revision_code": "REVISÃO ATUAL",
+                    "status": "STATUS",
+                    "revisoes": "QTDE DE REVISÕES",
+                }
+            )
+            df2 = df2.sort_values("QTDE DE REVISÕES", ascending=False)
+            rev_table_html = df2.to_html(index=False, escape=False)
+
+    css = """
+    <style>
+      body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 24px; }
+      .hdr { width: 100%; border: 1px solid #e0e0e0; border-radius: 10px; padding: 14px; }
+      .hdr-grid { display: grid; grid-template-columns: 160px 1fr 160px; gap: 10px; align-items: center; }
+      .hdr img { max-height: 72px; max-width: 160px; }
+      .title { text-align: center; }
+      .title h1 { margin: 0; font-size: 18px; }
+      .sub { font-size: 12px; color: #333; margin-top: 4px; }
+      .sub2 { font-size: 12px; color: #333; margin-top: 2px; }
+      .badge { display:inline-block; padding: 2px 8px; border-radius: 10px; border:1px solid #e0e0e0; font-size:11px; color:#333; margin-top:6px; }
+      .btnbar { margin: 12px 0 0 0; display:flex; justify-content:flex-end; }
+      .printbtn { cursor:pointer; border: 1px solid #d9d9d9; padding: 8px 12px; border-radius: 10px; background:#fff; font-size: 12px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 12px; }
+      th, td { border: 1px solid #d9d9d9; padding: 6px 8px; }
+      th { background: #f5f5f5; }
+      .charts { margin-top: 14px; display: grid; grid-template-columns: 1fr; gap: 14px; }
+      .chart { border: 1px solid #e0e0e0; border-radius: 10px; padding: 10px; }
+      .chart img { width: 100%; height: auto; }
+      @media print {
+        .printbtn, .btnbar { display: none !important; }
+        body { margin: 0; }
+      }
+    </style>
+    """
+
+    left_logo_html = f'<img src="{logo_bk_uri}" />' if logo_bk_uri else ""
+    right_logo_html = f'<img src="{logo_cli_uri}" />' if logo_cli_uri else ""
+
+    hdr = (
+        '<div class="hdr"><div class="hdr-grid">'
+        f'<div style="text-align:left;">{left_logo_html}</div>'
+        '<div class="title">'
+        '<h1>BK Engenharia e Tecnologia</h1>'
+        f'<div class="sub">Cliente: {cliente}</div>'
+        f'<div class="sub2">Projeto: {proj_nome} &nbsp;&nbsp;|&nbsp;&nbsp; Nº: {proj_num}</div>'
+        f'<div class="badge">Status: {proj_status or "N/D"}</div>'
+        '</div>'
+        f'<div style="text-align:right;">{right_logo_html}</div>'
+        '</div>'
+        '<div class="btnbar"><button class="printbtn" onclick="window.print()">🖨️ Imprimir</button></div>'
+        '</div>'
+    )
+
+    html = ['<html><head><meta charset="utf-8"/>', css, '</head><body>']
+    html.append(hdr)
+
+    html.append('<h2>Relatório gerencial</h2>')
+    html.append('<h3>Quantidade de documentos por status</h3>')
+    html.append(status_table_html or "<p>Sem documentos para contabilizar.</p>")
+
+    html.append('<div class="charts">')
+    if pie_uri:
+        html.append('<div class="chart">')
+        html.append(f'<img src="{pie_uri}" />')
+        html.append('</div>')
+    if bk_cli_uri:
+        html.append('<div class="chart">')
+        html.append(f'<img src="{bk_cli_uri}" />')
+        html.append('</div>')
+    html.append('</div>')
+
+    html.append('<h3>Revisões por documento</h3>')
+    html.append(rev_table_html)
+
+    html.append('</body></html>')
+    return "\n".join(html)
+
+
 
 
 # ------------------------------
@@ -816,6 +1045,7 @@ def main() -> None:
 
         meta = _load_meta(engine, pid) or meta  # recarrega
         html_report = _build_report_html(meta, tasks_df, metrics_df)
+        html_manager_report = _build_manager_report_html(meta, tasks_df, metrics_df)
 
         st.download_button(
             "⬇️ Baixar relatório (HTML)",
@@ -824,6 +1054,16 @@ def main() -> None:
             mime="text/html",
             width='stretch',
         )
+        st.download_button(
+            "⬇️ Baixar relatório gerencial (HTML)",
+            data=html_manager_report.encode("utf-8"),
+            file_name=f"controle_projetos_gerencial_{pid}.html",
+            mime="text/html",
+            width='stretch',
+        )
+
+        with st.expander("👁️ Pré-visualizar relatório gerencial", expanded=False):
+            st.components.v1.html(html_manager_report, height=700, scrolling=True)
 
         # também exporta CSV (tabela + tempos)
         export_df = tasks_df.copy()
