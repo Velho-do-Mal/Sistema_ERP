@@ -117,6 +117,7 @@ with tab_prop:
         with c1:
             if st.button("➕ Nova proposta", use_container_width=True):
                 st.session_state["proposal_id"] = None
+                st.session_state["loaded_proposal_id"] = None
                 st.session_state["items_df"] = pd.DataFrame(columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"])
                 st.session_state["proposal_form_seed"] = {"code": None}
                 st.rerun()
@@ -160,11 +161,18 @@ with tab_prop:
             st.session_state["items_df"] = pd.DataFrame(columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"])
 
         if proposal_id:
-            with engine.begin() as conn:
-                data = get_proposal(conn, int(proposal_id))
-            p = data["proposal"]
-            items = data["items"]
-            st.session_state["items_df"] = items[["product_service_id","description","unit","qty","unit_price","total","sort_order"]].copy()
+            # Carrega do banco apenas quando o usuário troca de proposta.
+            # Isso evita perder itens inseridos localmente (ainda não salvos) a cada st.rerun().
+            _pid_int = int(proposal_id)
+            if st.session_state.get("loaded_proposal_id") != _pid_int:
+                with engine.begin() as conn:
+                    data = get_proposal(conn, _pid_int)
+                p = data["proposal"]
+                items = data["items"]
+                st.session_state["items_df"] = items[["product_service_id","description","unit","qty","unit_price","total","sort_order"]].copy()
+                st.session_state["loaded_proposal_id"] = _pid_int
+            else:
+                p = st.session_state.get("proposal_form_seed", {}) or {}
         else:
             p = st.session_state.get("proposal_form_seed", {}) or {}
             if not p.get("code"):
