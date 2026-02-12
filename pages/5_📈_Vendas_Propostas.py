@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import re
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -44,6 +45,26 @@ if not can_view("financeiro"):
     st.stop()
 
 tab_prop, tab_leads, tab_pedidos = st.tabs(["📑 Propostas", "🧲 Leads/Pipeline", "🧾 Pedidos (em evolução)"])
+
+def _next_code_from_existing(df_prop: pd.DataFrame) -> str:
+    """Gera o próximo código BK-PROP-AAAA-NN (sempre +1)."""
+    year = date.today().year
+    prefix = f"BK-PROP-{year}-"
+    if df_prop is None or getattr(df_prop, 'empty', True) or 'code' not in df_prop.columns:
+        return f"{prefix}01"
+    max_num = None
+    for c in df_prop['code'].dropna().astype(str).tolist():
+        if not c.startswith(prefix):
+            continue
+        suf = c[len(prefix):].strip()
+        if suf.isdigit():
+            n = int(suf)
+            if (max_num is None) or (n > max_num):
+                max_num = n
+    if max_num is None:
+        return f"{prefix}01"
+    return f"{prefix}{max_num + 1:02d}"
+
 
 
 
@@ -117,7 +138,6 @@ with tab_prop:
         with c1:
             if st.button("➕ Nova proposta", use_container_width=True):
                 st.session_state["proposal_id"] = None
-                st.session_state["loaded_proposal_id"] = None
                 st.session_state["items_df"] = pd.DataFrame(columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"])
                 st.session_state["proposal_form_seed"] = {"code": None}
                 st.rerun()
@@ -161,23 +181,15 @@ with tab_prop:
             st.session_state["items_df"] = pd.DataFrame(columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"])
 
         if proposal_id:
-            # Carrega do banco apenas quando o usuário troca de proposta.
-            # Isso evita perder itens inseridos localmente (ainda não salvos) a cada st.rerun().
-            _pid_int = int(proposal_id)
-            if st.session_state.get("loaded_proposal_id") != _pid_int:
-                with engine.begin() as conn:
-                    data = get_proposal(conn, _pid_int)
-                p = data["proposal"]
-                items = data["items"]
-                st.session_state["items_df"] = items[["product_service_id","description","unit","qty","unit_price","total","sort_order"]].copy()
-                st.session_state["loaded_proposal_id"] = _pid_int
-            else:
-                p = st.session_state.get("proposal_form_seed", {}) or {}
+            with engine.begin() as conn:
+                data = get_proposal(conn, int(proposal_id))
+            p = data["proposal"]
+            items = data["items"]
+            st.session_state["items_df"] = items[["product_service_id","description","unit","qty","unit_price","total","sort_order"]].copy()
         else:
             p = st.session_state.get("proposal_form_seed", {}) or {}
             if not p.get("code"):
-                with engine.begin() as conn:
-                    p["code"] = next_proposal_code(conn)
+                    p["code"] = _next_code_from_existing(df_prop)
             p.setdefault("title", "")
             p.setdefault("status", "rascunho")
             p.setdefault("client_id", None)
@@ -333,7 +345,7 @@ with tab_prop:
                         "value_total": float(total_geral),
                         "status": status,
                         "valid_until": valid_until.isoformat(),
-                        "notes": p.get("notes",""),
+                        "notes": "",
                         "objective": objective,
                         "scope": scope,
                         "resp_contratante": resp_contratante,
@@ -352,6 +364,24 @@ with tab_prop:
             if st.button("🧹 Limpar itens", use_container_width=True, disabled=edited.empty):
                 st.session_state["items_df"] = pd.DataFrame(columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"])
                 st.rerun()
+
+        # Excluir um item específico (além do limpar tudo)
+        if not edited.empty:
+            delc1, delc2 = st.columns([3,1])
+            with delc1:
+                _del_i = st.selectbox(
+                    "Excluir item",
+                    options=list(range(len(edited))),
+                    format_func=lambda i: f"{int(edited.iloc[i].get('sort_order', i))} • {str(edited.iloc[i].get('description',''))}"
+                )
+            with delc2:
+                if st.button("🗑️ Excluir item", use_container_width=True):
+                    df_new = edited.drop(index=_del_i).reset_index(drop=True)
+                    if not df_new.empty:
+                        df_new["sort_order"] = list(range(len(df_new)))
+                    st.session_state["items_df"] = compute_items_totals(df_new)
+                    st.rerun()
+
 
         st.markdown("#### 📄 Gerar/Imprimir HTML")
         # dados do cliente
