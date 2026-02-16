@@ -8,6 +8,7 @@ import plotly.express as px
 from bk_erp_shared.theme import apply_theme
 from bk_erp_shared.erp_db import ensure_erp_tables
 import bk_finance
+from controle_projetos_embutido import render_controle_projetos
 
 # --------------------------------------------------------
 # CONFIGURAÇÃO BÁSICA / CSS
@@ -1011,6 +1012,7 @@ tabs = st.tabs(
         "✅ Encerramento",
         "📑 Relatórios HTML",
         "📌 Plano de Ação",
+        "🗂️ Controle de Projetos",
     ]
 )
 
@@ -2939,3 +2941,16 @@ with tabs[9]:
             st.rerun()
     else:
         st.info("Nenhuma ação registrada no plano de ação.")
+
+
+# -------------------------------------------------
+# ABA: CONTROLE DE PROJETOS (embutido)
+# -------------------------------------------------
+with tabs[10]:
+    st.markdown("### 🗂️ Controle de Projetos (BK x Cliente)")
+    pid = int(st.session_state.get("current_project_id") or 0)
+    if not pid:
+        st.info("Selecione um projeto para visualizar o Controle de Projetos.")
+    else:
+        # Renderiza o Controle de Projetos usando o mesmo banco do ERP
+        render_controle_projetos(engine, pid)
