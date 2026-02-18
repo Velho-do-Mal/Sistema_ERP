@@ -60,24 +60,8 @@ def get_finance_db() -> Tuple[object, object]:
     return bk_finance.get_db()
 
 
-def ensure_erp_tables(engine=None, *_, **__) -> None:
-    """Garante as tabelas base do ERP.
-
-    Compatibilidade:
-    - Algumas paginas antigas chamam `ensure_erp_tables(engine)`.
-    - Outras chamam `ensure_erp_tables()`.
-
-    Este helper aceita ambos para evitar `TypeError` em producao.
-    """
-
-    # Compatibilidade entre chamadas antigas e novas:
-    # - Home.py chama ensure_erp_tables(engine)
-    # - Algumas paginas antigas chamavam ensure_erp_tables() sem passar engine
-    # - Em alguns pontos existiu chamada ensure_erp_tables(engine, SessionLocal)
-    #   (aceitamos *args/**kwargs para nao quebrar)
-    if engine is None:
-        # Se nao veio engine, usa o engine padrao do Financeiro.
-        engine, _ = get_finance_db()
+def ensure_erp_tables() -> None:
+    engine, _ = get_finance_db()
     dialect = engine.dialect.name
 
     # Tipos por dialeto
@@ -266,29 +250,6 @@ def ensure_erp_tables(engine=None, *_, **__) -> None:
             notes TEXT
         );
         """,
-
-        # -------------------------
-        # ESTOQUE DE MATERIAIS
-        # (sem FK para não depender da ordem de criação de tabelas externas)
-        # -------------------------
-        f"""
-        CREATE TABLE IF NOT EXISTS material_stock (
-            id {id_col},
-            material_code TEXT NOT NULL,
-            description TEXT,
-            supplier_id INTEGER NULL,
-            project_id INTEGER NULL,
-            qty_purchased {money} DEFAULT 0,
-            purchase_value {money} DEFAULT 0,
-            purchase_date TEXT,
-            validity_date TEXT,
-            notes TEXT,
-            qty_used {money} DEFAULT 0,
-            created_at TEXT,
-            updated_at TEXT
-        );
-        """,
-
         # -------------------------
         # DOCUMENTOS (anexos gerais)
         # -------------------------
