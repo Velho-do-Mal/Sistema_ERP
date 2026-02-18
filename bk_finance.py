@@ -1163,11 +1163,6 @@ def accounts_ui(SessionLocal):
             active = st.checkbox("Ativa", value=True)
             notes = st.text_area("Observações")
 
-            attachments = st.file_uploader(
-                "Anexos (boletos/comprovantes/recibos) — opcional",
-                accept_multiple_files=True,
-                key="tx_new_attachments",
-            )
             ok = st.form_submit_button("Salvar")
 
         if ok:
@@ -1249,89 +1244,260 @@ def accounts_ui(SessionLocal):
 # UI: CRUD CATEGORIAS
 # =========================
 def categories_ui(SessionLocal):
-    st.header("📂 Categorias")
+    """Categorias com: filtro por tipo, subcategorias vinculadas, tabela editável."""
     session = SessionLocal()
-
     try:
-        cats = session.query(Category).order_by(Category.parent_id.asc().nullsfirst(), Category.name.asc()).all()
-        cat_map = {c.id: c for c in cats}
-        cat_options = ["(Sem pai)"] + [f"{c.id} - {c.name}" for c in cats]
+        # ── Carregar todas as categorias ──
+        all_cats = session.query(Category).order_by(
+            Category.parent_id.asc().nullsfirst(), Category.name.asc()
+        ).all()
+        cat_map = {c.id: c for c in all_cats}
 
-        st.subheader("Cadastrar / Atualizar")
-        with st.form("cat_form"):
-            cat_id = st.number_input("ID (para editar, deixe 0 para novo)", min_value=0, step=1, value=0)
-            name = st.text_input("Nome *")
-            mov_type = st.selectbox("Tipo", ["both", "entrada", "saida"], index=0)
-            parent_sel = st.selectbox("Categoria Pai", cat_options, index=0)
-            notes = st.text_area("Observações")
-            ok = st.form_submit_button("Salvar")
+        # ── Abas: Categorias Pai | Subcategorias ──
+        tab_cat, tab_sub = st.tabs(["📂 Categorias", "🗂️ Subcategorias"])
 
-        if ok:
-            if not name.strip():
-                st.error("Nome é obrigatório.")
-            else:
-                parent_id = None
-                if parent_sel != "(Sem pai)":
-                    parent_id = int(parent_sel.split(" - ", 1)[0])
+        # ══════════════════════════════════════
+        # ABA 1: CATEGORIAS PAI
+        # ══════════════════════════════════════
+        with tab_cat:
+            st.markdown('<div class="bk-section">➕ Nova Categoria</div>', unsafe_allow_html=True)
+            c1, c2, c3 = st.columns([2, 1, 3])
+            with c1:
+                new_cat_name = st.text_input("Nome *", key="new_cat_name")
+            with c2:
+                new_mov_type = st.selectbox(
+                    "Tipo de movimento",
+                    options=["both", "entrada", "saida"],
+                    format_func=lambda x: {"both": "Ambos (entrada/saída)", "entrada": "Entrada", "saida": "Saída"}[x],
+                    key="new_cat_type"
+                )
+            with c3:
+                new_cat_notes = st.text_input("Observação (opcional)", key="new_cat_notes")
 
-                if cat_id and cat_id > 0:
-                    c = session.query(Category).get(int(cat_id))
-                    if not c:
-                        st.error("ID não encontrado.")
-                    else:
-                        before = {"name": c.name, "mov_type": c.mov_type, "parent_id": c.parent_id}
-                        c.name = name.strip()
-                        c.mov_type = mov_type
-                        c.parent_id = parent_id
-                        c.notes = notes.strip() or None
-                        audit(session, "UPDATE", "categories", c.id, before, {"name": c.name})
-                        session.commit()
-                        st.success("Categoria atualizada.")
+            if st.button("💾 Criar Categoria", key="btn_create_cat", type="primary"):
+                if not new_cat_name.strip():
+                    st.error("Nome é obrigatório.")
                 else:
-                    c = Category(name=name.strip(), mov_type=mov_type, parent_id=parent_id, notes=notes.strip() or None)
+                    c = Category(
+                        name=new_cat_name.strip(),
+                        mov_type=new_mov_type,
+                        parent_id=None,
+                        notes=new_cat_notes.strip() or None
+                    )
                     session.add(c)
                     session.flush()
                     audit(session, "CREATE", "categories", c.id, None, {"name": c.name})
                     session.commit()
-                    st.success("Categoria criada.")
+                    st.success(f"Categoria '{c.name}' criada.")
+                    st.rerun()
 
-        st.markdown("---")
-        st.subheader("Lista de Categorias")
-        cats = session.query(Category).order_by(Category.parent_id.asc().nullsfirst(), Category.name.asc()).all()
-        if not cats:
-            st.info("Nenhuma categoria cadastrada.")
-        else:
-            def parent_name(pid):
-                return cat_map[pid].name if pid in cat_map else ""
+            st.markdown("---")
 
-            df = pd.DataFrame([{
-                "ID": c.id,
-                "Nome": c.name,
-                "Pai": parent_name(c.parent_id) if c.parent_id else "",
-                "Tipo": c.mov_type,
-                "Obs": (c.notes or "")[:60],
-            } for c in cats])
-            st.dataframe(df, width="stretch")
+            # Filtro por tipo
+            filtro_tipo = st.radio(
+                "Filtrar por tipo:",
+                options=["Todos", "Entrada", "Saída"],
+                horizontal=True,
+                key="cat_filtro_tipo"
+            )
 
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                del_id = st.number_input("ID para excluir", min_value=0, step=1, value=0, key="cat_del_id")
-            with col2:
-                if st.button("Excluir categoria (cuidado)", type="secondary"):
-                    if del_id and del_id > 0:
+            # Pais (sem parent_id)
+            pais = [c for c in all_cats if c.parent_id is None]
+            if filtro_tipo == "Entrada":
+                pais = [c for c in pais if c.mov_type in ("entrada", "both")]
+            elif filtro_tipo == "Saída":
+                pais = [c for c in pais if c.mov_type in ("saida", "both")]
+
+            if not pais:
+                st.info("Nenhuma categoria encontrada para o filtro selecionado.")
+            else:
+                tipo_label = {"both": "Ambos", "entrada": "Entrada", "saida": "Saída"}
+                df_cats = pd.DataFrame([{
+                    "id": c.id,
+                    "Nome": c.name,
+                    "Tipo": tipo_label.get(c.mov_type, c.mov_type),
+                    "Obs": (c.notes or "")[:80],
+                } for c in pais])
+
+                edited = st.data_editor(
+                    df_cats,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    key="editor_cats",
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                        "Nome": st.column_config.TextColumn("Nome", width="medium"),
+                        "Tipo": st.column_config.SelectboxColumn(
+                            "Tipo",
+                            options=["Ambos", "Entrada", "Saída"],
+                            width="small"
+                        ),
+                        "Obs": st.column_config.TextColumn("Observação", width="large"),
+                    }
+                )
+
+                if st.button("💾 Salvar edições de Categorias", key="btn_save_cats"):
+                    tipo_rev = {"Ambos": "both", "Entrada": "entrada", "Saída": "saida"}
+                    changed = 0
+                    for _, row in edited.iterrows():
+                        c = cat_map.get(int(row["id"]))
+                        if c:
+                            before = {"name": c.name, "mov_type": c.mov_type, "notes": c.notes}
+                            c.name = str(row["Nome"]).strip()
+                            c.mov_type = tipo_rev.get(str(row["Tipo"]), c.mov_type)
+                            c.notes = str(row["Obs"]).strip() or None
+                            audit(session, "UPDATE", "categories", c.id, before, {"name": c.name})
+                            changed += 1
+                    session.commit()
+                    st.success(f"{changed} categoria(s) salva(s).")
+                    st.rerun()
+
+                st.markdown("---")
+                st.markdown("**🗑️ Excluir categoria:**")
+                del_opts = {"— selecione —": None} | {f"{c.id} — {c.name}": c.id for c in pais}
+                del_sel = st.selectbox("Selecione para excluir", list(del_opts.keys()), key="cat_del_sel")
+                if st.button("Excluir categoria selecionada", type="secondary", key="btn_del_cat"):
+                    del_id = del_opts.get(del_sel)
+                    if del_id:
                         c = session.query(Category).get(int(del_id))
-                        if not c:
-                            st.error("ID não encontrado.")
-                        else:
+                        if c:
                             if session.query(Category).filter(Category.parent_id == c.id).first():
-                                st.error("Não pode excluir: esta categoria tem subcategorias.")
+                                st.error("Não é possível excluir: esta categoria tem subcategorias. Exclua-as primeiro.")
                             else:
                                 before = {"name": c.name}
                                 session.delete(c)
                                 audit(session, "DELETE", "categories", del_id, before, None)
                                 session.commit()
-                                st.success("Excluída.")
+                                st.success("Categoria excluída.")
                                 st.rerun()
+
+        # ══════════════════════════════════════
+        # ABA 2: SUBCATEGORIAS
+        # ══════════════════════════════════════
+        with tab_sub:
+            st.markdown('<div class="bk-section">➕ Nova Subcategoria</div>', unsafe_allow_html=True)
+
+            # Filtro de tipo para mostrar só as categorias-pai relevantes
+            sc1, sc2 = st.columns([1, 2])
+            with sc1:
+                sub_tipo_filtro = st.selectbox(
+                    "Tipo de movimento",
+                    options=["Todos", "Entrada", "Saída"],
+                    key="sub_tipo_filtro"
+                )
+
+            # Filtrar pais para o dropdown
+            pais_all = [c for c in all_cats if c.parent_id is None]
+            if sub_tipo_filtro == "Entrada":
+                pais_filtrados = [c for c in pais_all if c.mov_type in ("entrada", "both")]
+            elif sub_tipo_filtro == "Saída":
+                pais_filtrados = [c for c in pais_all if c.mov_type in ("saida", "both")]
+            else:
+                pais_filtrados = pais_all
+
+            pai_opts = {"— selecione a categoria pai —": None} | {
+                f"{c.id} — {c.name}": c.id for c in pais_filtrados
+            }
+
+            with sc2:
+                pai_sel_label = st.selectbox("Categoria Pai *", list(pai_opts.keys()), key="sub_pai_sel")
+
+            s1, s2 = st.columns([2, 3])
+            with s1:
+                sub_name = st.text_input("Nome da subcategoria *", key="sub_name")
+            with s2:
+                sub_notes = st.text_input("Observação (opcional)", key="sub_notes")
+
+            if st.button("💾 Criar Subcategoria", key="btn_create_sub", type="primary"):
+                pai_id = pai_opts.get(pai_sel_label)
+                if not sub_name.strip():
+                    st.error("Nome é obrigatório.")
+                elif pai_id is None:
+                    st.error("Selecione a categoria pai.")
+                else:
+                    pai_obj = cat_map.get(pai_id)
+                    sub = Category(
+                        name=sub_name.strip(),
+                        mov_type=pai_obj.mov_type if pai_obj else "both",
+                        parent_id=pai_id,
+                        notes=sub_notes.strip() or None
+                    )
+                    session.add(sub)
+                    session.flush()
+                    audit(session, "CREATE", "categories", sub.id, None, {"name": sub.name, "parent_id": pai_id})
+                    session.commit()
+                    st.success(f"Subcategoria '{sub.name}' criada em '{pai_obj.name if pai_obj else ''}'.")
+                    st.rerun()
+
+            st.markdown("---")
+
+            # Lista de subcategorias filtrada pela categoria-pai selecionada
+            st.markdown("**Visualizar / Editar subcategorias por categoria:**")
+            pai_view_opts = {"— todas —": None} | {
+                f"{c.id} — {c.name}": c.id for c in pais_all
+            }
+            pai_view_sel = st.selectbox("Filtrar por categoria:", list(pai_view_opts.keys()), key="sub_view_pai")
+            pai_view_id = pai_view_opts.get(pai_view_sel)
+
+            subs = [c for c in all_cats if c.parent_id is not None]
+            if pai_view_id is not None:
+                subs = [c for c in subs if c.parent_id == pai_view_id]
+
+            if not subs:
+                st.info("Nenhuma subcategoria encontrada.")
+            else:
+                df_subs = pd.DataFrame([{
+                    "id": s.id,
+                    "Nome": s.name,
+                    "Categoria Pai": cat_map[s.parent_id].name if s.parent_id in cat_map else "",
+                    "Obs": (s.notes or "")[:80],
+                } for s in subs])
+
+                edited_subs = st.data_editor(
+                    df_subs,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    key="editor_subs",
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                        "Nome": st.column_config.TextColumn("Nome", width="medium"),
+                        "Categoria Pai": st.column_config.TextColumn("Categoria Pai", disabled=True, width="medium"),
+                        "Obs": st.column_config.TextColumn("Observação", width="large"),
+                    }
+                )
+
+                if st.button("💾 Salvar edições de Subcategorias", key="btn_save_subs"):
+                    sub_map = {s.id: s for s in subs}
+                    changed = 0
+                    for _, row in edited_subs.iterrows():
+                        s = sub_map.get(int(row["id"]))
+                        if s:
+                            before = {"name": s.name, "notes": s.notes}
+                            s.name = str(row["Nome"]).strip()
+                            s.notes = str(row["Obs"]).strip() or None
+                            audit(session, "UPDATE", "categories", s.id, before, {"name": s.name})
+                            changed += 1
+                    session.commit()
+                    st.success(f"{changed} subcategoria(s) salva(s).")
+                    st.rerun()
+
+                st.markdown("---")
+                st.markdown("**🗑️ Excluir subcategoria:**")
+                sub_del_opts = {"— selecione —": None} | {f"{s.id} — {s.name}": s.id for s in subs}
+                sub_del_sel = st.selectbox("Selecione para excluir", list(sub_del_opts.keys()), key="sub_del_sel")
+                if st.button("Excluir subcategoria selecionada", type="secondary", key="btn_del_sub"):
+                    sub_del_id = sub_del_opts.get(sub_del_sel)
+                    if sub_del_id:
+                        s = session.query(Category).get(int(sub_del_id))
+                        if s:
+                            before = {"name": s.name}
+                            session.delete(s)
+                            audit(session, "DELETE", "categories", sub_del_id, before, None)
+                            session.commit()
+                            st.success("Subcategoria excluída.")
+                            st.rerun()
 
     except Exception as e:
         session.rollback()
@@ -1473,56 +1639,78 @@ def clients_suppliers_ui(SessionLocal):
 # UI: CENTROS DE CUSTO
 # =========================
 def cost_centers_ui(SessionLocal):
-    st.header("🏷️ Centros de Custo")
+    """Centros de Custo — formulário de criação + tabela editável + exclusão por seleção."""
     session = SessionLocal()
-
     try:
-        st.subheader("Cadastrar / Atualizar")
-        with st.form("cc_form"):
-            cc_id = st.number_input("ID (editar, 0=novo)", min_value=0, step=1, value=0)
-            name = st.text_input("Nome *")
-            notes = st.text_area("Observações")
-            ok = st.form_submit_button("Salvar")
+        # ── Criar novo ──
+        st.markdown('<div class="bk-section">➕ Novo Centro de Custo</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            new_cc_name = st.text_input("Nome *", key="new_cc_name")
+        with c2:
+            new_cc_notes = st.text_input("Observação (opcional)", key="new_cc_notes")
 
-        if ok:
-            if not name.strip():
+        if st.button("💾 Criar Centro de Custo", key="btn_create_cc", type="primary"):
+            if not new_cc_name.strip():
                 st.error("Nome é obrigatório.")
             else:
-                if cc_id and cc_id > 0:
-                    cc = session.query(CostCenter).get(int(cc_id))
-                    if not cc:
-                        st.error("ID não encontrado.")
-                    else:
-                        before = {"name": cc.name}
-                        cc.name = name.strip()
-                        cc.notes = notes.strip() or None
-                        audit(session, "UPDATE", "cost_centers", cc.id, before, {"name": cc.name})
-                        session.commit()
-                        st.success("Atualizado.")
-                else:
-                    cc = CostCenter(name=name.strip(), notes=notes.strip() or None)
-                    session.add(cc)
-                    session.flush()
-                    audit(session, "CREATE", "cost_centers", cc.id, None, {"name": cc.name})
-                    session.commit()
-                    st.success("Criado.")
+                cc = CostCenter(name=new_cc_name.strip(), notes=new_cc_notes.strip() or None)
+                session.add(cc)
+                session.flush()
+                audit(session, "CREATE", "cost_centers", cc.id, None, {"name": cc.name})
+                session.commit()
+                st.success(f"Centro de custo '{cc.name}' criado.")
+                st.rerun()
 
         st.markdown("---")
-        st.subheader("Lista")
-        ccs = session.query(CostCenter).order_by(CostCenter.name.asc()).all()
-        df = pd.DataFrame([{"ID": c.id, "Nome": c.name, "Obs": (c.notes or "")[:60]} for c in ccs])
-        st.dataframe(df, width="stretch")
 
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            del_id = st.number_input("ID para excluir", min_value=0, step=1, value=0, key="cc_del")
-        with col2:
-            if st.button("Excluir centro de custo", type="secondary"):
-                if del_id and del_id > 0:
+        ccs = session.query(CostCenter).order_by(CostCenter.name.asc()).all()
+        if not ccs:
+            st.info("Nenhum centro de custo cadastrado ainda.")
+        else:
+            cc_map = {c.id: c for c in ccs}
+            df_cc = pd.DataFrame([{
+                "id": c.id,
+                "Nome": c.name,
+                "Observação": (c.notes or ""),
+            } for c in ccs])
+
+            edited = st.data_editor(
+                df_cc,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="editor_cc",
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                    "Nome": st.column_config.TextColumn("Nome", width="medium"),
+                    "Observação": st.column_config.TextColumn("Observação", width="large"),
+                }
+            )
+
+            if st.button("💾 Salvar edições", key="btn_save_cc"):
+                changed = 0
+                for _, row in edited.iterrows():
+                    cc = cc_map.get(int(row["id"]))
+                    if cc:
+                        before = {"name": cc.name, "notes": cc.notes}
+                        cc.name = str(row["Nome"]).strip()
+                        cc.notes = str(row["Observação"]).strip() or None
+                        audit(session, "UPDATE", "cost_centers", cc.id, before, {"name": cc.name})
+                        changed += 1
+                session.commit()
+                st.success(f"{changed} registro(s) salvo(s).")
+                st.rerun()
+
+            st.markdown("---")
+            st.markdown("**🗑️ Excluir centro de custo:**")
+            del_opts = {"— selecione —": None} | {f"{c.id} — {c.name}": c.id for c in ccs}
+            del_sel = st.selectbox("Selecione para excluir", list(del_opts.keys()), key="cc_del_sel")
+            if st.button("Excluir selecionado", type="secondary", key="btn_del_cc"):
+                del_id = del_opts.get(del_sel)
+                if del_id:
                     cc = session.query(CostCenter).get(int(del_id))
-                    if not cc:
-                        st.error("ID não encontrado.")
-                    else:
+                    if cc:
                         before = {"name": cc.name}
                         session.delete(cc)
                         audit(session, "DELETE", "cost_centers", del_id, before, None)
@@ -1825,44 +2013,112 @@ def add_transaction_ui(SessionLocal):
         sup_opts = ["(Sem fornecedor)"] + [f"{s.id} - {s.name}" for s in suppliers]
         cc_opts = ["(Sem centro de custo)"] + [f"{c.id} - {c.name}" for c in ccs]
 
-        st.subheader("Novo lançamento")
-        with st.form("tx_form"):
-            tx_type = st.selectbox("Tipo", ["entrada", "saida", "transferencia"], index=1)
-            tx_date = st.date_input("Data (competência)", value=date.today())
-            due_date = st.date_input("Vencimento (opcional)", value=date.today())
-            use_due = st.checkbox("Usar vencimento", value=True)
+        st.markdown('<div class="bk-section">➕ Novo Lançamento</div>', unsafe_allow_html=True)
 
-            paid = st.checkbox("Já está realizado?", value=False)
-            paid_date = None
-            if paid:
-                paid_date = st.date_input("Data de pagamento/recebimento", value=date.today())
-            else:
-                st.caption("Data de pagamento/recebimento: será preenchida quando marcar como realizado.")
+        # ── Seleção de categoria e subcategoria FORA do form (reativas) ──
+        all_categories = session.query(Category).order_by(
+            Category.parent_id.asc().nullsfirst(), Category.name.asc()
+        ).all()
+
+        # Tipo de movimento — controla filtro de categorias
+        tx_type_pre = st.selectbox(
+            "Tipo de movimento",
+            ["entrada", "saida", "transferencia"],
+            index=1,
+            key="tx_type_pre",
+            format_func=lambda x: {"entrada": "🟢 Entrada", "saida": "🔴 Saída", "transferencia": "🔄 Transferência"}[x]
+        )
+
+        # Categorias pai filtradas pelo tipo
+        cats_pai = [c for c in all_categories if c.parent_id is None]
+        if tx_type_pre == "entrada":
+            cats_pai = [c for c in cats_pai if c.mov_type in ("entrada", "both")]
+        elif tx_type_pre == "saida":
+            cats_pai = [c for c in cats_pai if c.mov_type in ("saida", "both")]
+
+        cat_pai_opts = {"(Sem categoria)": None} | {f"{c.name}": c.id for c in cats_pai}
+
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            cat_pai_sel = st.selectbox("Categoria", list(cat_pai_opts.keys()), key="tx_cat_pai")
+        cat_pai_id = cat_pai_opts.get(cat_pai_sel)
+
+        # Subcategorias filtradas pela categoria pai selecionada
+        subs_disponiveis = [
+            c for c in all_categories
+            if c.parent_id is not None and (cat_pai_id is None or c.parent_id == cat_pai_id)
+        ]
+        sub_opts = {"(Sem subcategoria)": None} | {f"{s.name}": s.id for s in subs_disponiveis}
+        with tc2:
+            sub_sel = st.selectbox("Subcategoria", list(sub_opts.keys()), key="tx_subcat",
+                                   disabled=(len(subs_disponiveis) == 0))
+
+        # Anexos FORA do form (st.file_uploader não funciona bem dentro de st.form)
+        attachments = st.file_uploader(
+            "📎 Anexos (boletos, comprovantes, contratos, NFs)",
+            accept_multiple_files=True,
+            key="tx_new_attachments",
+            help="Aceita PDF, imagens e documentos. Você pode selecionar múltiplos arquivos."
+        )
+
+        with st.form("tx_form"):
+            r1c1, r1c2, r1c3 = st.columns([2, 2, 1])
+            with r1c1:
+                tx_date = st.date_input("Data competência", value=date.today())
+            with r1c2:
+                due_date = st.date_input("Vencimento", value=date.today())
+            with r1c3:
+                use_due = st.checkbox("Usar vencimento", value=True)
+
+            r2c1, r2c2 = st.columns([1, 1])
+            with r2c1:
+                paid = st.checkbox("Já está realizado?", value=False)
+            with r2c2:
+                # Sempre renderizado — evita bug de estado no Streamlit dentro de st.form
+                paid_date = st.date_input("Data realização (se pago)", value=date.today())
 
             description = st.text_input("Descrição *")
-            amount = st.number_input("Valor *", value=0.0, step=100.0)
+            amount = st.number_input("Valor (R$) *", value=0.0, step=100.0, format="%.2f")
 
-            if tx_type == "transferencia":
-                from_acc = st.selectbox("De (Conta)", acc_opts, index=1 if len(acc_opts) > 1 else 0)
-                to_acc = st.selectbox("Para (Conta)", acc_opts, index=1 if len(acc_opts) > 1 else 0, key="to_acc")
-            else:
-                account_sel = st.selectbox("Conta", acc_opts, index=1 if len(acc_opts) > 1 else 0)
+            # ── Contas: SEMPRE os três campos renderizados ──
+            # (evita NameError quando tx_type muda entre renders)
+            fa1, fa2, fa3 = st.columns(3)
+            with fa1:
+                account_sel = st.selectbox("Conta (entrada/saída)", acc_opts,
+                                           index=1 if len(acc_opts) > 1 else 0)
+            with fa2:
+                from_acc = st.selectbox("De (só transferência)", acc_opts,
+                                        index=1 if len(acc_opts) > 1 else 0, key="from_acc")
+            with fa3:
+                to_acc = st.selectbox("Para (só transferência)", acc_opts,
+                                      index=min(2, len(acc_opts) - 1), key="to_acc")
 
-            category_sel = st.selectbox("Categoria", cat_opts, index=0)
             cost_center_sel = st.selectbox("Centro de Custo", cc_opts, index=0)
 
-            client_sel = st.selectbox("Cliente (para entradas)", cli_opts, index=0)
-            supplier_sel = st.selectbox("Fornecedor (para saídas)", sup_opts, index=0)
+            # ── Cliente e Fornecedor: SEMPRE renderizados ──
+            cf1, cf2 = st.columns(2)
+            with cf1:
+                client_sel  = st.selectbox("Cliente", cli_opts, index=0)
+            with cf2:
+                supplier_sel = st.selectbox("Fornecedor", sup_opts, index=0)
 
-            reference = st.text_input("Referência (NF, boleto, contrato)")
-            notes = st.text_area("Observações")
+            reference = st.text_input("Referência (NF, boleto, contrato, PO)")
+            notes = st.text_area("Observações", height=80)
 
-            st.markdown("**Recorrência (opcional)**")
+            st.markdown("**📅 Recorrência (opcional)**")
             rec_enable = st.checkbox("Criar recorrência", value=False)
-            rec_count = st.number_input("Quantidade total", min_value=1, value=1, step=1)
-            rec_period = st.selectbox("Periodicidade", ["monthly", "weekly", "biweekly", "yearly"], index=0)
+            rec_count = st.number_input("Quantidade de parcelas", min_value=1, value=1, step=1)
+            rec_period = st.selectbox(
+                "Periodicidade", ["monthly", "weekly", "biweekly", "yearly"], index=0,
+                format_func=lambda x: {
+                    "monthly": "Mensal", "weekly": "Semanal",
+                    "biweekly": "Quinzenal", "yearly": "Anual"
+                }[x]
+            )
+            ok = st.form_submit_button("💾 Salvar lançamento", type="primary", use_container_width=True)
 
-            ok = st.form_submit_button("Salvar lançamento")
+        # tx_type vem do seletor externo (reativo, fora do form)
+        tx_type = tx_type_pre
 
         if ok:
             if not description.strip():
@@ -1871,7 +2127,7 @@ def add_transaction_ui(SessionLocal):
                 st.error("Valor deve ser maior que 0.")
             else:
                 due = due_date if use_due else None
-                pd_dt = paid_date if paid else None
+                pd_dt = paid_date if paid else None  # paid_date widget sempre renderizado; só usa se paid=True
 
                 # Anexos (opcional): boletos, comprovantes, recibos, etc.
                 uploaded_payloads = []
@@ -1895,10 +2151,16 @@ def add_transaction_ui(SessionLocal):
                         session.add(att)
                         audit(session, "CREATE", "attachments", None, None, {"tx_id": int(tx_id), "filename": str(fname)})
 
-                cat_id = int(category_sel.split(" - ", 1)[0]) if category_sel != "(Sem categoria)" else None
-                cc_id = int(cost_center_sel.split(" - ", 1)[0]) if cost_center_sel != "(Sem centro de custo)" else None
-                cli_id = int(client_sel.split(" - ", 1)[0]) if client_sel != "(Sem cliente)" else None
-                sup_id = int(supplier_sel.split(" - ", 1)[0]) if supplier_sel != "(Sem fornecedor)" else None
+                # Categoria: subcategoria tem prioridade sobre a pai
+                _sub_id = sub_opts.get(sub_sel) if sub_sel else None
+                cat_id = _sub_id if _sub_id is not None else cat_pai_id
+                cc_id = (int(cost_center_sel.split(" - ", 1)[0])
+                         if cost_center_sel != "(Sem centro de custo)" else None)
+                # Cliente só para entrada; Fornecedor só para saída
+                cli_id = (int(client_sel.split(" - ", 1)[0])
+                          if tx_type == "entrada" and client_sel != "(Sem cliente)" else None)
+                sup_id = (int(supplier_sel.split(" - ", 1)[0])
+                          if tx_type == "saida" and supplier_sel != "(Sem fornecedor)" else None)
 
                 if tx_type == "transferencia":
                     if from_acc == "(Sem conta)" or to_acc == "(Sem conta)":
@@ -1968,7 +2230,7 @@ def add_transaction_ui(SessionLocal):
         st.markdown("---")
         st.subheader("Pesquisar / Listar lançamentos")
 
-        f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
+        f1, f2, f3, f4, f5 = st.columns([2, 2, 1, 1, 2])
         with f1:
             start = st.date_input("Data inicial", value=date.today().replace(day=1), key="tx_list_start")
         with f2:
@@ -1976,7 +2238,9 @@ def add_transaction_ui(SessionLocal):
         with f3:
             base = st.selectbox("Base", ["Tudo", "Realizado", "Previsto"], index=0, key="tx_list_base")
         with f4:
-            q = st.text_input("Busca (descrição/ref)", value="", key="tx_list_q")
+            tipo_filtro = st.selectbox("Tipo", ["Todos", "entrada", "saida", "transferencia"], index=0, key="tx_list_tipo")
+        with f5:
+            q = st.text_input("Busca (descrição/ref/qualquer)", value="", key="tx_list_q")
 
         if end < start:
             st.warning("A data final deve ser maior ou igual à data inicial.")
@@ -1991,9 +2255,20 @@ def add_transaction_ui(SessionLocal):
                 continue
             if not (start <= dref <= end):
                 continue
+            if tipo_filtro != "Todos" and t.type != tipo_filtro:
+                continue
             if q.strip():
                 qq = q.strip().lower()
-                if qq not in (t.description or "").lower() and qq not in (t.reference or "").lower():
+                # Busca em descrição, referência, conta, categoria, cliente, fornecedor
+                campos = " ".join([
+                    (t.description or ""),
+                    (t.reference or ""),
+                    (t.account.name if t.account else ""),
+                    (t.category.name if t.category else ""),
+                    (t.client.name if t.client else ""),
+                    (t.supplier.name if t.supplier else ""),
+                ]).lower()
+                if qq not in campos:
                     continue
             filtered.append(t)
 
@@ -2454,103 +2729,189 @@ if __name__ == "__main__":
 # -------------------------------------------------------------------
 
 def clients_ui(SessionLocal):
-    """UI de cadastro/listagem de Clientes (tabela: clients)."""
-    st.subheader("👥 Clientes")
+    """UI de cadastro/listagem de Clientes — formulário + tabela editável."""
     session = SessionLocal()
     try:
-        with st.form("bk_erp_client_form", clear_on_submit=False):
-            cid = st.number_input("ID (editar, 0=novo)", min_value=0, step=1, value=0)
-            name = st.text_input("Nome *")
-            doc = st.text_input("Documento (CPF/CNPJ)")
-            notes = st.text_area("Observações", height=80)
-            ok = st.form_submit_button("Salvar")
+        # ── Criar novo ──
+        st.markdown('<div class="bk-section">➕ Novo Cliente</div>', unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([2, 2, 3])
+        with col1:
+            new_cli_name = st.text_input("Nome *", key="new_cli_name")
+        with col2:
+            new_cli_doc = st.text_input("CPF/CNPJ", key="new_cli_doc")
+        with col3:
+            new_cli_notes = st.text_input("Observação", key="new_cli_notes")
 
-        if ok:
-            if not name.strip():
+        if st.button("💾 Criar Cliente", key="btn_create_cli", type="primary"):
+            if not new_cli_name.strip():
                 st.error("Nome é obrigatório.")
             else:
-                if cid and int(cid) > 0:
-                    c = session.query(Client).get(int(cid))
-                    if not c:
-                        st.error("ID não encontrado.")
-                    else:
-                        c.name = name.strip()
-                        c.document = (doc.strip() or None)
-                        c.notes = (notes.strip() or None)
-                        session.commit()
-                        st.success("Cliente atualizado.")
-                else:
-                    c = Client(name=name.strip(), document=(doc.strip() or None), notes=(notes.strip() or None))
-                    session.add(c)
-                    session.commit()
-                    st.success(f"Cliente criado (ID {c.id}).")
+                c = Client(
+                    name=new_cli_name.strip(),
+                    document=new_cli_doc.strip() or None,
+                    notes=new_cli_notes.strip() or None
+                )
+                session.add(c)
+                session.flush()
+                audit(session, "CREATE", "clients", c.id, None, {"name": c.name})
+                session.commit()
+                st.success(f"Cliente '{c.name}' criado.")
+                st.rerun()
 
-        # Listagem
-        df = pd.read_sql(text("SELECT id, name, document, notes FROM clients ORDER BY name"), session.bind)
-        st.dataframe(df, width="stretch", hide_index=True)
+        st.markdown("---")
 
-        with st.expander("🗑️ Excluir cliente"):
-            did = st.number_input("ID para excluir", min_value=0, step=1, value=0, key="del_client_id")
-            if st.button("Excluir", key="btn_del_client"):
-                if did and int(did) > 0:
-                    c = session.query(Client).get(int(did))
-                    if not c:
-                        st.error("ID não encontrado.")
-                    else:
+        clients = session.query(Client).order_by(Client.name.asc()).all()
+        if not clients:
+            st.info("Nenhum cliente cadastrado ainda.")
+        else:
+            cli_map = {c.id: c for c in clients}
+            df_cli = pd.DataFrame([{
+                "id": c.id,
+                "Nome": c.name,
+                "CPF/CNPJ": c.document or "",
+                "Observação": (c.notes or ""),
+            } for c in clients])
+
+            edited = st.data_editor(
+                df_cli,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="editor_clients",
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                    "Nome": st.column_config.TextColumn("Nome", width="medium"),
+                    "CPF/CNPJ": st.column_config.TextColumn("CPF/CNPJ", width="medium"),
+                    "Observação": st.column_config.TextColumn("Observação", width="large"),
+                }
+            )
+
+            if st.button("💾 Salvar edições", key="btn_save_cli"):
+                changed = 0
+                for _, row in edited.iterrows():
+                    c = cli_map.get(int(row["id"]))
+                    if c:
+                        before = {"name": c.name, "document": c.document}
+                        c.name = str(row["Nome"]).strip()
+                        c.document = str(row["CPF/CNPJ"]).strip() or None
+                        c.notes = str(row["Observação"]).strip() or None
+                        audit(session, "UPDATE", "clients", c.id, before, {"name": c.name})
+                        changed += 1
+                session.commit()
+                st.success(f"{changed} cliente(s) salvo(s).")
+                st.rerun()
+
+            st.markdown("---")
+            st.markdown("**🗑️ Excluir cliente:**")
+            del_opts = {"— selecione —": None} | {f"{c.id} — {c.name}": c.id for c in clients}
+            del_sel = st.selectbox("Selecione para excluir", list(del_opts.keys()), key="cli_del_sel")
+            if st.button("Excluir selecionado", type="secondary", key="btn_del_cli"):
+                del_id = del_opts.get(del_sel)
+                if del_id:
+                    c = session.query(Client).get(int(del_id))
+                    if c:
+                        before = {"name": c.name}
                         session.delete(c)
+                        audit(session, "DELETE", "clients", del_id, before, None)
                         session.commit()
                         st.success("Cliente excluído.")
                         st.rerun()
+    except Exception as e:
+        session.rollback()
+        st.error(f"Erro em Clientes: {e}")
     finally:
         session.close()
 
 
 def suppliers_ui(SessionLocal):
-    """UI de cadastro/listagem de Fornecedores/Prestadores (tabela: suppliers)."""
-    st.subheader("🏭 Fornecedores / Prestadores")
+    """UI de cadastro/listagem de Fornecedores — formulário + tabela editável."""
     session = SessionLocal()
     try:
-        with st.form("bk_erp_supplier_form", clear_on_submit=False):
-            sid = st.number_input("ID (editar, 0=novo)", min_value=0, step=1, value=0)
-            name = st.text_input("Nome *")
-            doc = st.text_input("Documento (CPF/CNPJ)")
-            notes = st.text_area("Observações", height=80)
-            ok = st.form_submit_button("Salvar")
+        st.markdown('<div class="bk-section">➕ Novo Fornecedor / Prestador</div>', unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([2, 2, 3])
+        with col1:
+            new_sup_name = st.text_input("Nome *", key="new_sup_name")
+        with col2:
+            new_sup_doc = st.text_input("CPF/CNPJ", key="new_sup_doc")
+        with col3:
+            new_sup_notes = st.text_input("Observação", key="new_sup_notes")
 
-        if ok:
-            if not name.strip():
+        if st.button("💾 Criar Fornecedor", key="btn_create_sup", type="primary"):
+            if not new_sup_name.strip():
                 st.error("Nome é obrigatório.")
             else:
-                if sid and int(sid) > 0:
-                    s = session.query(Supplier).get(int(sid))
-                    if not s:
-                        st.error("ID não encontrado.")
-                    else:
-                        s.name = name.strip()
-                        s.document = (doc.strip() or None)
-                        s.notes = (notes.strip() or None)
-                        session.commit()
-                        st.success("Fornecedor atualizado.")
-                else:
-                    s = Supplier(name=name.strip(), document=(doc.strip() or None), notes=(notes.strip() or None))
-                    session.add(s)
-                    session.commit()
-                    st.success(f"Fornecedor criado (ID {s.id}).")
+                s = Supplier(
+                    name=new_sup_name.strip(),
+                    document=new_sup_doc.strip() or None,
+                    notes=new_sup_notes.strip() or None
+                )
+                session.add(s)
+                session.flush()
+                audit(session, "CREATE", "suppliers", s.id, None, {"name": s.name})
+                session.commit()
+                st.success(f"Fornecedor '{s.name}' criado.")
+                st.rerun()
 
-        df = pd.read_sql(text("SELECT id, name, document, notes FROM suppliers ORDER BY name"), session.bind)
-        st.dataframe(df, width="stretch", hide_index=True)
+        st.markdown("---")
 
-        with st.expander("🗑️ Excluir fornecedor"):
-            did = st.number_input("ID para excluir", min_value=0, step=1, value=0, key="del_supplier_id")
-            if st.button("Excluir", key="btn_del_supplier"):
-                if did and int(did) > 0:
-                    s = session.query(Supplier).get(int(did))
-                    if not s:
-                        st.error("ID não encontrado.")
-                    else:
+        suppliers = session.query(Supplier).order_by(Supplier.name.asc()).all()
+        if not suppliers:
+            st.info("Nenhum fornecedor cadastrado ainda.")
+        else:
+            sup_map = {s.id: s for s in suppliers}
+            df_sup = pd.DataFrame([{
+                "id": s.id,
+                "Nome": s.name,
+                "CPF/CNPJ": s.document or "",
+                "Observação": (s.notes or ""),
+            } for s in suppliers])
+
+            edited = st.data_editor(
+                df_sup,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="editor_suppliers",
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                    "Nome": st.column_config.TextColumn("Nome", width="medium"),
+                    "CPF/CNPJ": st.column_config.TextColumn("CPF/CNPJ", width="medium"),
+                    "Observação": st.column_config.TextColumn("Observação", width="large"),
+                }
+            )
+
+            if st.button("💾 Salvar edições", key="btn_save_sup"):
+                changed = 0
+                for _, row in edited.iterrows():
+                    s = sup_map.get(int(row["id"]))
+                    if s:
+                        before = {"name": s.name, "document": s.document}
+                        s.name = str(row["Nome"]).strip()
+                        s.document = str(row["CPF/CNPJ"]).strip() or None
+                        s.notes = str(row["Observação"]).strip() or None
+                        audit(session, "UPDATE", "suppliers", s.id, before, {"name": s.name})
+                        changed += 1
+                session.commit()
+                st.success(f"{changed} fornecedor(es) salvo(s).")
+                st.rerun()
+
+            st.markdown("---")
+            st.markdown("**🗑️ Excluir fornecedor:**")
+            del_opts = {"— selecione —": None} | {f"{s.id} — {s.name}": s.id for s in suppliers}
+            del_sel = st.selectbox("Selecione para excluir", list(del_opts.keys()), key="sup_del_sel")
+            if st.button("Excluir selecionado", type="secondary", key="btn_del_sup"):
+                del_id = del_opts.get(del_sel)
+                if del_id:
+                    s = session.query(Supplier).get(int(del_id))
+                    if s:
+                        before = {"name": s.name}
                         session.delete(s)
+                        audit(session, "DELETE", "suppliers", del_id, before, None)
                         session.commit()
                         st.success("Fornecedor excluído.")
                         st.rerun()
+    except Exception as e:
+        session.rollback()
+        st.error(f"Erro em Fornecedores: {e}")
     finally:
         session.close()
