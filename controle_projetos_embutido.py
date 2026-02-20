@@ -25,9 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
-
-
-
+from sqlalchemy.orm import sessionmaker
 # --- Compatibilidade de schema (migrações leves em runtime) -----------------
 def _ensure_doc_tasks_schema(engine) -> None:
     """Garante colunas novas em `project_doc_tasks` sem exigir migração manual.
@@ -235,7 +233,8 @@ def _ensure_control_tables(engine, SessionLocal) -> None:
     ddl_tasks = ddl_tasks_pg if "postgres" in dialect else ddl_tasks_sqlite
     ddl_events = ddl_events_pg if "postgres" in dialect else ddl_events_sqlite
 
-    with SessionLocal() as session:
+    session = SessionLocal()
+    try:
         session.execute(text(ddl_meta))
         session.execute(text(ddl_tasks))
         session.execute(text(ddl_events))
@@ -257,6 +256,8 @@ def _ensure_control_tables(engine, SessionLocal) -> None:
             session.commit()
         except Exception:
             session.rollback()
+    finally:
+        session.close()
 
 
 # ------------------------------
@@ -301,7 +302,8 @@ def _load_meta(engine, project_id: int) -> Dict:
 
 
 def _upsert_meta(SessionLocal, project_id: int, meta: Dict) -> None:
-    with SessionLocal() as session:
+    session = SessionLocal()
+    try:
         # tenta update
         upd = session.execute(
             text("""
@@ -343,6 +345,8 @@ def _upsert_meta(SessionLocal, project_id: int, meta: Dict) -> None:
                 },
             )
         session.commit()
+    finally:
+        session.close()
 
 
 def _list_doc_tasks(engine, project_id: int) -> pd.DataFrame:
@@ -380,7 +384,8 @@ def _insert_event(SessionLocal, project_id: int, doc_task_id: int, status: str, 
     else:
         ev_date = start_date or date.today()
     responsible = _responsible_from_status(status)
-    with SessionLocal() as session:
+    session = SessionLocal()
+    try:
         session.execute(
             text("""
                 INSERT INTO doc_status_events (doc_task_id, project_id, event_date, status, responsible, revision_code)
@@ -396,6 +401,8 @@ def _insert_event(SessionLocal, project_id: int, doc_task_id: int, status: str, 
             },
         )
         session.commit()
+    finally:
+        session.close()
 
 
 def _upsert_doc_tasks(SessionLocal, engine, project_id: int, edited: pd.DataFrame) -> Tuple[int, int, int]:
@@ -414,7 +421,8 @@ def _upsert_doc_tasks(SessionLocal, engine, project_id: int, edited: pd.DataFram
         if col not in edited.columns:
             edited[col] = "" if col != "Excluir" else False
 
-    with SessionLocal() as session:
+    session = SessionLocal()
+    try:
         for _, row in edited.iterrows():
             rid = row.get("id")
             rid_int = int(rid) if (pd.notna(rid) and str(rid).strip() != "") else None
@@ -545,6 +553,8 @@ def _upsert_doc_tasks(SessionLocal, engine, project_id: int, edited: pd.DataFram
                 _insert_event(SessionLocal, project_id, rid_int, status, rev, start_date, delivery_date)
 
         session.commit()
+    finally:
+        session.close()
 
     return inserted, updated, deleted
 
@@ -1098,6 +1108,10 @@ def render_controle_projetos(engine, project_id: Optional[int] = None) -> None:
     - Se project_id for None: mostra seletor (modo standalone).
     """
     ensure_erp_tables()
+    # Session factory local para este módulo (evita NameError em ambientes onde SessionLocal não existe)
+    SessionLocal = sessionmaker(bind=engine)
+    # garante as tabelas e colunas necessárias para o Controle de Projetos
+    _ensure_control_tables(engine, SessionLocal)
     _ensure_doc_tasks_schema(engine)
     apply_theme()
 
