@@ -9,6 +9,14 @@ from sqlalchemy import text
 from bk_erp_shared.theme import apply_theme
 from bk_erp_shared.erp_db import get_finance_db, ensure_erp_tables
 from bk_erp_shared.auth import login_and_guard, can_view, current_user
+from bk_erp_shared.theme import bk_section, bk_kpi_row
+try:
+    from bk_erp_shared.bk_charts import (
+        fig_pipeline_leads, fig_propostas_status, fig_propostas_valor, bk_plotly,
+    )
+    HAS_BK_CHARTS = True
+except Exception:
+    HAS_BK_CHARTS = False
 
 from bk_erp_shared.sales import (
     UNITS,
@@ -95,6 +103,12 @@ def _load_categories():
         return cats
 
 
+def delete_proposal(conn, proposal_id: int) -> None:
+    """Remove proposta e seus itens (FK). Deve ser chamada dentro de engine.begin()."""
+    conn.execute(text("DELETE FROM proposal_items WHERE proposal_id = :pid"), {"pid": proposal_id})
+    conn.execute(text("DELETE FROM proposals WHERE id = :pid"), {"pid": proposal_id})
+
+
 def _create_receivable_from_proposal(proposal_id: int, description: str, amount: float, due: date,
                                      account_id: int | None, category_id: int | None,
                                      client_id: int | None = None, project_id: int | None = None):
@@ -179,14 +193,25 @@ with tab_prop:
         # seed
         if "items_df" not in st.session_state:
             st.session_state["items_df"] = pd.DataFrame(columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"])
+        if "items_editor_v" not in st.session_state:
+            st.session_state["items_editor_v"] = 0
 
         if proposal_id:
-            with engine.begin() as conn:
-                data = get_proposal(conn, int(proposal_id))
-            p = data["proposal"]
-            items = data["items"]
-            st.session_state["items_df"] = items[["product_service_id","description","unit","qty","unit_price","total","sort_order"]].copy()
+            # Evita sobrescrever itens inseridos no front a cada rerun.
+            if st.session_state.get("_loaded_proposal_id") != int(proposal_id):
+                with engine.begin() as conn:
+                    data = get_proposal(conn, int(proposal_id))
+                p = data["proposal"]
+                items = data["items"]
+                st.session_state["items_df"] = items[["product_service_id","description","unit","qty","unit_price","total","sort_order"]].copy()
+                st.session_state["proposal_form_seed"] = dict(p)
+                st.session_state["_loaded_proposal_id"] = int(proposal_id)
+                st.session_state["items_editor_v"] = 0  # reset ao abrir nova proposta
+            else:
+                p = st.session_state.get("proposal_form_seed", {}) or {}
         else:
+            st.session_state["_loaded_proposal_id"] = None
+
             p = st.session_state.get("proposal_form_seed", {}) or {}
             if not p.get("code"):
                     p["code"] = _next_code_from_existing(df_prop)
@@ -208,7 +233,7 @@ with tab_prop:
         st.markdown("### ✍️ Editor de Proposta")
         f1, f2, f3 = st.columns([1,2,1])
         with f1:
-            code = st.text_input("Código", value=p.get("code",""), disabled=True)
+            code = st.text_input("Código", value=p.get("code",""), disabled=bool(proposal_id))
         with f2:
             title = st.text_input("Título", value=p.get("title",""))
         with f3:
@@ -305,6 +330,7 @@ with tab_prop:
                 "sort_order": int(len(df_items)),
             }
             st.session_state["items_df"] = compute_items_totals(df_items)
+            st.session_state["items_editor_v"] = st.session_state.get("items_editor_v", 0) + 1
             st.rerun()
 
         df_edit = st.session_state["items_df"].copy()
@@ -323,7 +349,7 @@ with tab_prop:
                 "total": st.column_config.NumberColumn("Total (R$)", disabled=True),
                 "sort_order": st.column_config.NumberColumn("Ord.", step=1),
             },
-            key=f"items_editor_{proposal_id or 'new'}"
+            key=f"items_editor_{proposal_id or 'new'}_v{st.session_state.get('items_editor_v', 0)}"
         )
 
         edited = compute_items_totals(edited)
@@ -341,6 +367,7 @@ with tab_prop:
                         "title": title.strip() or "Proposta",
                         "client_id": client_id,
                         "lead_id": None,
+                        "project_id": project_id,
                         "project_id": project_id,
                         "value_total": float(total_geral),
                         "status": status,
@@ -365,6 +392,17 @@ with tab_prop:
                 st.session_state["items_df"] = pd.DataFrame(columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"])
                 st.rerun()
 
+            # Excluir somente 1 item do orçamento
+            if not edited.empty:
+                _labels = [f"{i+1} - {str(row.get('description','')).strip() or '(sem descrição)'}" for i, row in edited.reset_index(drop=True).iterrows()]
+                _sel = st.selectbox("Item para excluir", ["—"] + _labels, index=0, key="del_item_sel")
+                if st.button("🗑️ Excluir item selecionado", use_container_width=True, disabled=_sel == "—", key="btn_del_item"):
+                    _idx = int(_sel.split(" - ", 1)[0]) - 1
+                    _new_df = edited.drop(index=_idx).reset_index(drop=True)
+                    st.session_state["items_df"] = _new_df
+                    st.session_state["items_editor_v"] = st.session_state.get("items_editor_v", 0) + 1
+                    st.rerun()
+
         # Excluir um item específico (além do limpar tudo)
         if not edited.empty:
             delc1, delc2 = st.columns([3,1])
@@ -380,8 +418,41 @@ with tab_prop:
                     if not df_new.empty:
                         df_new["sort_order"] = list(range(len(df_new)))
                     st.session_state["items_df"] = compute_items_totals(df_new)
+                    st.session_state["items_editor_v"] = st.session_state.get("items_editor_v", 0) + 1
                     st.rerun()
 
+
+
+        # ── Excluir proposta selecionada ─────────────────────────
+        if proposal_id:
+            st.divider()
+            with st.expander("🗑️ Excluir proposta selecionada", expanded=False):
+                st.warning(
+                    f"⚠️ Esta ação é **irreversível**. Todos os itens da proposta **{code}** "
+                    f"— *{title or 'sem título'}* — serão removidos permanentemente."
+                )
+                _confirm_delete = st.checkbox(
+                    "Confirmo que desejo excluir esta proposta.",
+                    value=False,
+                    key="confirm_delete_proposal",
+                )
+                if st.button(
+                    "🗑️ Excluir proposta",
+                    use_container_width=True,
+                    disabled=not _confirm_delete,
+                    type="primary",
+                    key="btn_delete_proposal",
+                ):
+                    with engine.begin() as conn:
+                        delete_proposal(conn, int(proposal_id))
+                    st.success(f"Proposta {code} excluída com sucesso.")
+                    st.session_state["proposal_id"] = None
+                    st.session_state["_loaded_proposal_id"] = None
+                    st.session_state["items_editor_v"] = 0
+                    st.session_state["items_df"] = pd.DataFrame(
+                        columns=["product_service_id","description","unit","qty","unit_price","total","sort_order"]
+                    )
+                    st.rerun()
 
         st.markdown("#### 📄 Gerar/Imprimir HTML")
         # dados do cliente
@@ -486,3 +557,58 @@ with tab_leads:
 
 with tab_pedidos:
     st.info("Pedidos/vendas serão evoluídos aqui (ex.: pedido, faturamento, integração com compras e projetos).")
+
+# ════════════════════════════════════════
+# PAINEL ANALÍTICO — Vendas & Propostas
+# (injetado após as abas existentes)
+# ════════════════════════════════════════
+st.markdown("---")
+bk_section("📊 Painel Analítico de Vendas")
+
+try:
+    with engine.begin() as _conn:
+        df_prop_all = pd.read_sql(
+            text("SELECT id, code, title, status, value_total, created_at FROM proposals ORDER BY id DESC"),
+            _conn
+        )
+        df_leads_all = pd.read_sql(
+            text("SELECT id, name, company, status, stage, value_estimate FROM leads ORDER BY id DESC"),
+            _conn
+        )
+
+    if df_prop_all.empty and df_leads_all.empty:
+        st.info("Nenhuma proposta ou lead cadastrada ainda.")
+    else:
+        # KPIs
+        total_prop = df_prop_all["value_total"].sum() if not df_prop_all.empty else 0
+        ganhas = len(df_prop_all[df_prop_all["status"] == "aprovada"]) if not df_prop_all.empty else 0
+        n_leads = len(df_leads_all)
+        leads_ganhos = len(df_leads_all[df_leads_all.get("stage", df_leads_all.get("status","")) == "ganho"]) if not df_leads_all.empty else 0
+
+        bk_kpi_row([
+            ("Propostas", len(df_prop_all), "blue"),
+            ("Valor Total", f"R$ {total_prop:,.0f}".replace(",", "."), "teal"),
+            ("Aprovadas", ganhas, "green"),
+            ("Leads", n_leads, "orange"),
+            ("Leads Ganhos", leads_ganhos, "green"),
+        ])
+
+        if HAS_BK_CHARTS:
+            col1, col2 = st.columns(2)
+            with col1:
+                if not df_prop_all.empty:
+                    bk_plotly(fig_propostas_status(df_prop_all), key="vnd_prop_status")
+                else:
+                    st.info("Nenhuma proposta ainda.")
+            with col2:
+                if not df_prop_all.empty:
+                    bk_plotly(fig_propostas_valor(df_prop_all), key="vnd_prop_valor")
+                else:
+                    st.info("Nenhuma proposta ainda.")
+
+            if not df_leads_all.empty:
+                stage_col = "stage" if "stage" in df_leads_all.columns else "status"
+                df_leads_all["stage"] = df_leads_all.get(stage_col, df_leads_all.get("status",""))
+                bk_plotly(fig_pipeline_leads(df_leads_all), key="vnd_pipeline_leads")
+except Exception as _e:
+    st.info(f"Painel analítico indisponível: {_e}")
