@@ -7,6 +7,14 @@ from sqlalchemy import text
 from bk_erp_shared.theme import apply_theme
 from bk_erp_shared.erp_db import get_finance_db, ensure_erp_tables
 from bk_erp_shared.auth import login_and_guard, can_view
+from bk_erp_shared.theme import bk_section, bk_kpi_row
+try:
+    from bk_erp_shared.bk_charts import (
+        fig_compras_status, fig_compras_fornecedor, fig_compras_mensal, bk_plotly,
+    )
+    HAS_BK_CHARTS = True
+except Exception:
+    HAS_BK_CHARTS = False
 
 import bk_finance
 
@@ -183,3 +191,46 @@ with c2:
                 conn.execute(text("DELETE FROM purchase_orders WHERE id=:id"), {"id": int(del_id)})
             st.success("Excluído.")
             st.rerun()
+
+# ════════════════════════════════════════
+# PAINEL ANALÍTICO — Compras
+# ════════════════════════════════════════
+st.markdown("---")
+bk_section("📊 Painel Analítico de Compras")
+
+try:
+    df_po_all = pd.read_sql(
+        text("SELECT * FROM purchase_orders ORDER BY id DESC"),
+        engine
+    )
+    # Enriquecer com nome do fornecedor
+    sup_name_map = {s.id: s.name for s in suppliers}
+    df_po_all["supplier"] = df_po_all["supplier_id"].map(sup_name_map).fillna("—")
+
+    if df_po_all.empty:
+        st.info("Nenhum pedido de compra cadastrado ainda.")
+    else:
+        # KPIs
+        total_po = df_po_all["value_total"].sum()
+        n_abertas = (df_po_all["status"] == "aberta").sum()
+        n_aprovadas = (df_po_all["status"] == "aprovada").sum()
+        n_canceladas = (df_po_all["status"] == "cancelada").sum()
+
+        bk_kpi_row([
+            ("Total em Compras", f"R$ {total_po:,.0f}".replace(",", "."), "blue"),
+            ("Pedidos", len(df_po_all), "teal"),
+            ("Abertas", n_abertas, "orange"),
+            ("Aprovadas", n_aprovadas, "green"),
+            ("Canceladas", n_canceladas, "red"),
+        ])
+
+        if HAS_BK_CHARTS:
+            col1, col2 = st.columns(2)
+            with col1:
+                bk_plotly(fig_compras_status(df_po_all), key="po_status_donut")
+            with col2:
+                bk_plotly(fig_compras_fornecedor(df_po_all), key="po_fornecedor_bar")
+
+            bk_plotly(fig_compras_mensal(df_po_all), key="po_mensal_bar")
+except Exception as _e:
+    st.info(f"Painel analítico indisponível: {_e}")

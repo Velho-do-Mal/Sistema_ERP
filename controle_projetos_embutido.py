@@ -1348,12 +1348,46 @@ def render_controle_projetos(engine, project_id: Optional[int] = None) -> None:
             top_cli = merged.sort_values("dias_CLIENTE", ascending=False).head(10)
             top_bk = merged.sort_values("dias_BK", ascending=False).head(10)
 
+            import plotly.graph_objs as _go
             if not top_total.empty:
-                st.bar_chart(top_total.set_index("doc_name")["dias_total"], width='stretch')
+                _fig = _go.Figure(_go.Bar(
+                    x=top_total["doc_name"], y=top_total["dias_total"],
+                    marker_color="#3B82F6", opacity=0.85,
+                ))
+                _fig.update_layout(height=320, margin=dict(l=20,r=20,t=30,b=80),
+                    title="Top 10 — Dias totais por documento",
+                    title_font=dict(size=13, color="#93C5FD"),
+                    paper_bgcolor="#0F172A", plot_bgcolor="#1E293B",
+                    font=dict(color="#F1F5F9"),
+                    xaxis=dict(tickangle=-35, gridcolor="#334155"),
+                    yaxis=dict(gridcolor="#334155"))
+                st.plotly_chart(_fig, use_container_width=True)
             if not top_cli.empty:
-                st.bar_chart(top_cli.set_index("doc_name")["dias_CLIENTE"], width='stretch')
+                _fig2 = _go.Figure(_go.Bar(
+                    x=top_cli["doc_name"], y=top_cli["dias_CLIENTE"],
+                    marker_color="#14B8A6", opacity=0.85,
+                ))
+                _fig2.update_layout(height=320, margin=dict(l=20,r=20,t=30,b=80),
+                    title="Top 10 — Dias aguardando CLIENTE",
+                    title_font=dict(size=13, color="#93C5FD"),
+                    paper_bgcolor="#0F172A", plot_bgcolor="#1E293B",
+                    font=dict(color="#F1F5F9"),
+                    xaxis=dict(tickangle=-35, gridcolor="#334155"),
+                    yaxis=dict(gridcolor="#334155"))
+                st.plotly_chart(_fig2, use_container_width=True)
             if not top_bk.empty:
-                st.bar_chart(top_bk.set_index("doc_name")["dias_BK"], width='stretch')
+                _fig3 = _go.Figure(_go.Bar(
+                    x=top_bk["doc_name"], y=top_bk["dias_BK"],
+                    marker_color="#F59E0B", opacity=0.85,
+                ))
+                _fig3.update_layout(height=320, margin=dict(l=20,r=20,t=30,b=80),
+                    title="Top 10 — Dias aguardando BK",
+                    title_font=dict(size=13, color="#93C5FD"),
+                    paper_bgcolor="#0F172A", plot_bgcolor="#1E293B",
+                    font=dict(color="#F1F5F9"),
+                    xaxis=dict(tickangle=-35, gridcolor="#334155"),
+                    yaxis=dict(gridcolor="#334155"))
+                st.plotly_chart(_fig3, use_container_width=True)
 
 
 

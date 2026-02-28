@@ -2338,6 +2338,45 @@ def add_transaction_ui(SessionLocal):
             else:
                 if action == "Editar":
                     st.info("Edite abaixo e salve.")
+
+                    # ── Anexos existentes (fora do form — download não funciona dentro de st.form) ──
+                    atts_edit = session.query(Attachment).filter(
+                        Attachment.transaction_id == t.id
+                    ).order_by(Attachment.uploaded_at.desc()).all()
+
+                    if atts_edit:
+                        st.markdown("**📎 Anexos existentes**")
+                        for a in atts_edit:
+                            col_n, col_dl, col_del = st.columns([3, 2, 1])
+                            with col_n:
+                                st.caption(f"📄 {a.filename}")
+                            with col_dl:
+                                st.download_button(
+                                    label="⬇️ Baixar",
+                                    data=a.data,
+                                    file_name=a.filename,
+                                    mime=a.content_type or "application/octet-stream",
+                                    key=f"dl_edit_{a.id}",
+                                    use_container_width=True,
+                                )
+                            with col_del:
+                                if st.button("🗑️", key=f"del_edit_{a.id}", help="Excluir anexo"):
+                                    before = {"filename": a.filename, "tx_id": a.transaction_id}
+                                    session.delete(a)
+                                    audit(session, "DELETE", "attachments", a.id, before, None)
+                                    session.commit()
+                                    st.success(f"Anexo '{a.filename}' excluído.")
+                                    st.rerun()
+                        st.markdown("---")
+
+                    # ── Adicionar novos anexos (fora do form) ──
+                    new_atts = st.file_uploader(
+                        "📎 Adicionar anexos (boletos, NFs, comprovantes)",
+                        accept_multiple_files=True,
+                        key=f"edit_tx_attachments_{t.id}",
+                        help="Aceita PDF, imagens e documentos."
+                    )
+
                     with st.form("edit_tx_form"):
                         e_date = st.date_input("Competência", value=t.date)
                         e_due = st.date_input("Vencimento", value=t.due_date or t.date)
@@ -2405,6 +2444,26 @@ def add_transaction_ui(SessionLocal):
 
                         audit(session, "UPDATE", "transactions", t.id, before, {"description": t.description})
                         session.commit()
+
+                        # Salvar novos anexos adicionados na edição
+                        for up in (new_atts or []):
+                            try:
+                                data = up.getvalue() if hasattr(up, "getvalue") else up.read()
+                            except Exception:
+                                data = b""
+                            if not data:
+                                continue
+                            att = Attachment(
+                                transaction_id=int(t.id),
+                                filename=str(up.name),
+                                content_type=getattr(up, "type", None),
+                                data=data,
+                            )
+                            session.add(att)
+                            audit(session, "CREATE", "attachments", None, None,
+                                  {"tx_id": int(t.id), "filename": str(up.name)})
+                        session.commit()
+
                         st.success("Atualizado.")
                         st.rerun()
 

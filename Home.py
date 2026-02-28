@@ -32,7 +32,7 @@ engine, SessionLocal = get_finance_db()
 login_and_guard(SessionLocal)
 
 # Header - logos/hero (carrega SVGs como data:uri)
-logo_uri = load_svg("assets/logo.svg")
+logo_uri = load_svg("assets/bk_icon.jpeg") or load_svg("assets/logo.svg")
 hero_uri = load_svg("assets/hero.svg")
 
 st.markdown(
@@ -236,16 +236,13 @@ with l2:
 # --------------------------
 # Insere a logo e o texto "Criado pela BK Engenharia e Tecnologia" no final do Home.
 # Observação: este footer é discreto e não altera o layout dos relatórios.
-try:
-    logo_uri = load_svg("assets/logo.svg")
-except Exception:
-    logo_uri = ""
-
+logo_uri_f = load_svg("assets/bk_icon.jpeg") or load_svg("assets/logo.svg") or ""
 st.markdown(
     f"""
-    <div style="display:flex; align-items:center; justify-content:center; gap:12px; margin-top:28px; color:#6C757D; font-size:13px;">
-        <img src="{logo_uri}" style="height:36px;" />
-        <div>Criado pela <b>BK Engenharia e Tecnologia</b></div>
+    <div style="display:flex; align-items:center; justify-content:center; gap:12px; margin-top:32px;
+                border-top:1px solid #334155; padding-top:20px; color:#64748B; font-size:12px;">
+        <img src="{logo_uri_f}" style="height:32px; border-radius:8px;" />
+        <div>Criado pela <b style="color:#93C5FD">BK Engenharia e Tecnologia</b></div>
     </div>
     """,
     unsafe_allow_html=True

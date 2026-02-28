@@ -405,7 +405,7 @@ def main():
     apply_theme()
 
     engine, SessionLocal = get_finance_db()
-    ensure_erp_tables(engine)
+    ensure_erp_tables()
     ensure_material_stock_schema(engine)
 
     login_and_guard(SessionLocal)

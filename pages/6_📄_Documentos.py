@@ -101,7 +101,7 @@ else:
                 else:
                     fn = row.iloc[0]["filename"]
                     ct = row.iloc[0]["content_type"]
-                    data = row.iloc[0]["data"]
+                    data = bytes(row.iloc[0]["data"])  # psycopg2 retorna BYTEA como memoryview
                     st.download_button("⬇️ Baixar", data=data, file_name=fn, mime=ct)
             else:
                 st.warning("Informe um ID.")
