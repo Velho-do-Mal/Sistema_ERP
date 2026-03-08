@@ -1,10 +1,13 @@
 import streamlit as st
-import streamlit.components.v1 as components  # IMPORT CORRETO PARA HTML
+import streamlit.components.v1 as components
 import psycopg2
 import json
 from datetime import datetime, date, timedelta
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
+import numpy as np
 from bk_erp_shared.theme import apply_theme
 from bk_erp_shared.erp_db import ensure_erp_tables
 import bk_finance
@@ -307,6 +310,14 @@ def compute_is_summary(tasks: list[dict]) -> dict[str, bool]:
     return is_summary
 
 
+def get_nivel_from_codigo(codigo: str) -> int:
+    """Retorna o nível baseado no código WBS (ex: 1 = nível 1, 1.1 = nível 2)"""
+    if not codigo:
+        return 1
+    return len(str(codigo).split("."))
+
+
+
 def calcular_cpm(tasks):
     """
     Calcula ES/EF/LS/LF (em dias corridos) com base em predecessoras (padrão FS)
@@ -481,116 +492,222 @@ def calcular_cpm(tasks):
     return tasks, projeto_fim
 
 
+
 def gerar_curva_s_trabalho(tasks, data_inicio_str):
     """
-    Curva S dupla: Planejado (CPM) × Realizado (ponderado por % de avanço).
-    Estilo BK Planejamento Estratégico.
+    CURVA S MELHORADA - Baseada em DATAS PLANEJADAS e REAIS (estilo MS Project)
+    Gera curva S verdadeira (sigmoide) baseada em datas, não apenas % concluído.
     """
     import plotly.graph_objects as go
     if not tasks or not data_inicio_str:
         return None
 
-    tasks_cpm, total_dias = calcular_cpm(tasks)
-    tasks_leaf = [t for t in tasks_cpm if not t.get("is_summary")]
-    if total_dias <= 0:
-        return None
-
-    soma_duracoes = sum(int(t.get("duracao") or 0) for t in tasks_leaf)
-    if soma_duracoes <= 0:
-        return None
-
-    # ── Planejado (CPM) ──
-    dias = list(range(0, total_dias + 1))
-    planejado = []
-    for d in dias:
-        acum = 0.0
-        for t in tasks_leaf:
-            dur = int(t.get("duracao") or 0)
-            es  = t.get("es", 0)
-            peso = dur / soma_duracoes if soma_duracoes > 0 else 0
-            if d <= es:        frac = 0.0
-            elif d >= es + dur: frac = 1.0
-            else:               frac = (d - es) / dur
-            acum += peso * frac
-        planejado.append(round(acum * 100.0, 2))
-
-    # ── Realizado (% de avanço ponderado por duração) ──
-    # Para cada tarefa-folha: contribuição = peso × (% avanço / 100)
-    # Distribuída linearmente ao longo do período planejado (start→finish)
-    realizado = [0.0] * (total_dias + 1)
-    for t in tasks_leaf:
-        dur  = int(t.get("duracao") or 0)
-        es   = t.get("es", 0)
-        peso = dur / soma_duracoes if soma_duracoes > 0 else 0
-        perc = float(t.get("percentual_avanco") or 0) / 100.0
-        perc = max(0.0, min(1.0, perc))
-        # distribui proporcionalmente ao longo dos dias planejados
-        for d in range(total_dias + 1):
-            if d <= es:         frac = 0.0
-            elif d >= es + dur: frac = perc           # para no % real
-            else:               frac = perc * (d - es) / dur if dur > 0 else 0.0
-            realizado[d] += peso * frac * 100.0
-
-    realizado = [round(v, 2) for v in realizado]
-
-    # ── Figura ──
-    fig = go.Figure()
-
-    # Área planejada
-    fig.add_trace(go.Scatter(
-        x=dias, y=planejado,
-        mode="lines",
-        name="Planejado",
-        line=dict(color="#3b82f6", width=2.5, dash="dash"),
-        fill="tozeroy",
-        fillcolor="rgba(59,130,246,0.10)",
-        hovertemplate="Dia %{x}<br>Planejado: %{y:.1f}%<extra></extra>",
-    ))
-
-    # Linha realizado
-    fig.add_trace(go.Scatter(
-        x=dias, y=realizado,
-        mode="lines+markers",
-        name="Realizado",
-        line=dict(color="#22c55e", width=3),
-        marker=dict(size=5, color="#22c55e"),
-        fill="tozeroy",
-        fillcolor="rgba(34,197,94,0.12)",
-        hovertemplate="Dia %{x}<br>Realizado: %{y:.1f}%<extra></extra>",
-    ))
-
-    # Linha hoje — add_shape é compatível com todas as versões do plotly
     try:
-        data_ini = datetime.strptime(data_inicio_str, "%Y-%m-%d").date()
-        dia_hoje = (date.today() - data_ini).days
-        if 0 <= dia_hoje <= total_dias:
-            fig.add_shape(
-                type="line",
-                x0=dia_hoje, x1=dia_hoje, y0=0, y1=1,
-                xref="x", yref="paper",
-                line=dict(color="#f59e0b", width=2, dash="dot"),
-            )
-            fig.add_annotation(
-                x=dia_hoje, y=1.02, xref="x", yref="paper",
-                text="Hoje", showarrow=False,
-                font=dict(color="#f59e0b", size=11),
-                xanchor="left",
-            )
+        data_inicio_projeto = datetime.strptime(data_inicio_str, "%Y-%m-%d").date()
     except Exception:
+        return None
+
+    # Filtrar apenas tarefas folha (não-resumo)
+    _is_summary = compute_is_summary(tasks)
+    tasks_leaf = [t for t in tasks if not _is_summary.get(str(t.get("codigo", "")), False)]
+    
+    if not tasks_leaf:
+        return None
+
+    # Calcular range de datas
+    all_dates = []
+    for t in tasks_leaf:
+        di_str = t.get("data_inicio") or data_inicio_str
+        try:
+            di = datetime.strptime(di_str, "%Y-%m-%d").date()
+            all_dates.append(di)
+        except:
+            all_dates.append(data_inicio_projeto)
+        
+        dc_str = t.get("data_conclusao")
+        dur = int(t.get("duracao") or 1)
+        if dc_str:
+            try:
+                dc = datetime.strptime(dc_str, "%Y-%m-%d").date()
+                all_dates.append(dc)
+            except:
+                all_dates.append(di + timedelta(days=dur))
+        else:
+            try:
+                all_dates.append(di + timedelta(days=dur))
+            except:
+                pass
+        
+        # Datas reais
+        dir_str = t.get("data_inicio_real")
+        if dir_str:
+            try:
+                all_dates.append(datetime.strptime(dir_str, "%Y-%m-%d").date())
+            except:
+                pass
+        dcr_str = t.get("data_conclusao_real")
+        if dcr_str:
+            try:
+                all_dates.append(datetime.strptime(dcr_str, "%Y-%m-%d").date())
+            except:
+                pass
+
+    if not all_dates:
+        return None
+
+    data_min = min(all_dates)
+    data_max = max(all_dates)
+    total_dias = (data_max - data_min).days + 1
+    
+    if total_dias <= 0:
+        total_dias = 30
+
+    soma_duracoes = sum(int(t.get("duracao") or 1) for t in tasks_leaf)
+    if soma_duracoes <= 0:
+        soma_duracoes = len(tasks_leaf)
+
+    # Calcular curvas
+    dias = list(range(total_dias + 1))
+    planejado = []
+    realizado = []
+    
+    for d in dias:
+        data_atual = data_min + timedelta(days=d)
+        acum_plan = 0.0
+        acum_real = 0.0
+        
+        for t in tasks_leaf:
+            dur = int(t.get("duracao") or 1)
+            peso = dur / soma_duracoes if soma_duracoes > 0 else 1 / len(tasks_leaf)
+            
+            # PLANEJADO
+            di_str = t.get("data_inicio") or data_inicio_str
+            try:
+                di_plan = datetime.strptime(di_str, "%Y-%m-%d").date()
+            except:
+                di_plan = data_inicio_projeto
+            
+            dc_str = t.get("data_conclusao")
+            if dc_str:
+                try:
+                    dc_plan = datetime.strptime(dc_str, "%Y-%m-%d").date()
+                except:
+                    dc_plan = di_plan + timedelta(days=dur)
+            else:
+                dc_plan = di_plan + timedelta(days=dur)
+            
+            dur_plan_dias = max((dc_plan - di_plan).days, 1)
+            
+            if data_atual < di_plan:
+                frac_plan = 0.0
+            elif data_atual >= dc_plan:
+                frac_plan = 1.0
+            else:
+                frac_plan = (data_atual - di_plan).days / dur_plan_dias
+            
+            acum_plan += peso * frac_plan
+            
+            # REALIZADO
+            dir_str = t.get("data_inicio_real")
+            dcr_str = t.get("data_conclusao_real")
+            perc_avanco = float(t.get("percentual_avanco") or 0) / 100.0
+            
+            if dir_str and dcr_str:
+                try:
+                    di_real = datetime.strptime(dir_str, "%Y-%m-%d").date()
+                    dc_real = datetime.strptime(dcr_str, "%Y-%m-%d").date()
+                    dur_real_dias = max((dc_real - di_real).days, 1)
+                    
+                    if data_atual < di_real:
+                        frac_real = 0.0
+                    elif data_atual >= dc_real:
+                        frac_real = 1.0
+                    else:
+                        frac_real = (data_atual - di_real).days / dur_real_dias
+                except:
+                    frac_real = perc_avanco
+            elif dir_str:
+                try:
+                    di_real = datetime.strptime(dir_str, "%Y-%m-%d").date()
+                    if data_atual < di_real:
+                        frac_real = 0.0
+                    else:
+                        frac_real = perc_avanco
+                except:
+                    frac_real = perc_avanco
+            else:
+                if data_atual < di_plan:
+                    frac_real = 0.0
+                elif data_atual >= dc_plan:
+                    frac_real = perc_avanco
+                else:
+                    frac_tempo = (data_atual - di_plan).days / dur_plan_dias
+                    frac_real = min(frac_tempo, perc_avanco)
+            
+            acum_real += peso * frac_real
+        
+        planejado.append(round(acum_plan * 100.0, 2))
+        realizado.append(round(acum_real * 100.0, 2))
+
+    # Criar datas para eixo X
+    datas_eixo = [(data_min + timedelta(days=d)).strftime("%d/%m") for d in dias]
+    
+    # Suavização spline para curva S
+    try:
+        from scipy.interpolate import make_interp_spline
+        if len(dias) > 4:
+            x_smooth = np.linspace(0, len(dias)-1, len(dias)*3)
+            spl_plan = make_interp_spline(dias, planejado, k=3)
+            plan_smooth = np.clip(spl_plan(x_smooth), 0, 100)
+            spl_real = make_interp_spline(dias, realizado, k=3)
+            real_smooth = np.clip(spl_real(x_smooth), 0, 100)
+            datas_smooth = [datas_eixo[min(int(round(i)), len(datas_eixo)-1)] for i in x_smooth]
+            datas_plot = datas_smooth
+            plan_plot = plan_smooth
+            real_plot = real_smooth
+        else:
+            datas_plot = datas_eixo
+            plan_plot = planejado
+            real_plot = realizado
+    except:
+        datas_plot = datas_eixo
+        plan_plot = planejado
+        real_plot = realizado
+
+    # Figura
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=datas_plot, y=plan_plot, mode="lines", name="Planejado",
+        line=dict(color="#3b82f6", width=3, shape='spline'),
+        fill="tozeroy", fillcolor="rgba(59,130,246,0.15)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=datas_plot, y=real_plot, mode="lines", name="Realizado",
+        line=dict(color="#22c55e", width=3, shape='spline'),
+        fill="tozeroy", fillcolor="rgba(34,197,94,0.15)",
+    ))
+
+    # Linha hoje
+    try:
+        dia_hoje = (date.today() - data_min).days
+        if 0 <= dia_hoje <= total_dias:
+            idx_hoje = min(dia_hoje, len(datas_eixo)-1)
+            fig.add_vline(x=datas_eixo[idx_hoje], line=dict(color="#f59e0b", width=2, dash="dot"))
+            fig.add_annotation(x=datas_eixo[idx_hoje], y=105, text="<b>Hoje</b>", showarrow=False,
+                               font=dict(color="#f59e0b", size=11), bgcolor="rgba(13,27,42,0.8)")
+    except:
         pass
 
     fig.update_layout(
-        title=dict(text="📈 Curva S de Trabalho — Planejado × Realizado", font=dict(size=15, color="#e2e8f0")),
-        xaxis=dict(title="Dia do Projeto", gridcolor="rgba(255,255,255,0.07)"),
-        yaxis=dict(title="Progresso (%)", range=[0, 105], gridcolor="rgba(255,255,255,0.07)"),
-        template="plotly_dark",
-        height=380,
-        margin=dict(l=30, r=20, t=50, b=30),
+        title=dict(text="📈 Curva S — Planejado × Realizado (Baseada em Datas)", font=dict(size=15, color="#e2e8f0")),
+        xaxis=dict(title="Data", gridcolor="rgba(255,255,255,0.07)", tickangle=-45),
+        yaxis=dict(title="Progresso (%)", range=[0, 110], gridcolor="rgba(255,255,255,0.07)"),
+        template="plotly_dark", height=420, margin=dict(l=30, r=20, t=50, b=60),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
-        paper_bgcolor="rgba(13,27,42,0.0)",
-        plot_bgcolor="rgba(13,27,42,0.0)",
+        paper_bgcolor="rgba(13,27,42,0.0)", plot_bgcolor="rgba(13,27,42,0.0)",
     )
     return fig
+
 
 
 
@@ -701,205 +818,129 @@ def calcular_datas_eap(tasks, data_inicio_projeto=None):
     return out
 
 
+
 def gerar_organograma_eap(eap_tasks, nome_projeto="Projeto"):
     """
-    Organograma EAP estilo PMBOK — árvore top-down com caixas e linhas.
-    - Raiz do projeto no topo (nível 1)
-    - Entregas principais (nível 2) na segunda fileira
-    - Sub-atividades (nível 3: 2.1, 2.2...) abaixo de cada entrega
-    - Nível 4 (2.1.1, 2.1.2...) abaixo das sub-atividades
-    Cores por nível conforme PMBOK.
+    ORGANOGRAMA EAP por NÍVEIS - Estilo PMBOK conforme imagem de referência.
+    Nível 1: Projeto (verde escuro), Nível 2: Entregas (verde), 
+    Nível 3: Sub-entregas (amarelo), Nível 4: Pacotes (laranja)
     """
     import plotly.graph_objects as go
     if not eap_tasks:
         return None
 
-    # ── Paleta por nível (PMBOK) ────────────────────────────
-    COR_CAIXA  = {1: "#1e3a5f", 2: "#00a8e8", 3: "#ffd700", 4: "#ff6b6b"}
-    COR_BORDA  = {1: "#0d2137", 2: "#0077b6", 3: "#e6ac00", 4: "#cc0000"}
-    COR_TEXTO  = {1: "#ffffff", 2: "#000000", 3: "#000000", 4: "#ffffff"}
+    # Cores por nível
+    CORES = {
+        0: {"fill": "#1a5d1a", "border": "#0d3d0d", "text": "#ffffff"},
+        1: {"fill": "#2d8f2d", "border": "#1a6b1a", "text": "#ffffff"},
+        2: {"fill": "#f0c808", "border": "#c9a800", "text": "#000000"},
+        3: {"fill": "#f5a623", "border": "#d68c10", "text": "#000000"},
+        4: {"fill": "#ff8c42", "border": "#e67326", "text": "#000000"},
+    }
 
-    # ── Montar dicionário pai→filhos ─────────────────────────
-    tasks_sorted = sorted(eap_tasks, key=lambda t: str(t.get("codigo", "")))
-    cod_set = {str(t.get("codigo","")) for t in tasks_sorted}
-    task_map = {str(t.get("codigo","")): t for t in tasks_sorted}
+    # Organizar por nível
+    tasks_por_nivel = {}
+    task_map = {}
+    
+    for t in eap_tasks:
+        cod = str(t.get("codigo", ""))
+        if not cod:
+            continue
+        nivel = get_nivel_from_codigo(cod)
+        if nivel not in tasks_por_nivel:
+            tasks_por_nivel[nivel] = []
+        tasks_por_nivel[nivel].append(t)
+        task_map[cod] = t
+
+    if not tasks_por_nivel:
+        return None
+
+    fig = go.Figure()
+    shapes = []
+    annotations = []
+    
+    box_width = 0.12
+    box_height = 0.08
+    y_spacing = 0.18
+    pos_map = {}
+    
+    # Nó raiz (Projeto)
+    pos_map["__root__"] = (0.5, 0.95)
+    shapes.append(dict(type="rect", x0=0.5-box_width/2, y0=0.95-box_height/2,
+                       x1=0.5+box_width/2, y1=0.95+box_height/2,
+                       fillcolor=CORES[0]["fill"], line=dict(color=CORES[0]["border"], width=2)))
+    annotations.append(dict(x=0.5, y=0.95, text=f"<b>{nome_projeto[:20]}</b>", showarrow=False,
+                           font=dict(size=11, color=CORES[0]["text"])))
 
     def get_pai(cod):
         partes = cod.split(".")
         if len(partes) <= 1:
             return "__root__"
-        pai = ".".join(partes[:-1])
-        while pai not in cod_set and "." in pai:
-            pai = ".".join(pai.split(".")[:-1])
-        return pai if pai in cod_set else "__root__"
+        return ".".join(partes[:-1])
 
-    filhos = {"__root__": []}
-    for t in tasks_sorted:
-        cod = str(t.get("codigo",""))
-        pai = get_pai(cod)
-        filhos.setdefault(pai, [])
-        filhos.setdefault(cod, [])
-        filhos[pai].append(cod)
+    niveis = sorted(tasks_por_nivel.keys())
+    
+    for nivel in niveis:
+        tasks_nivel = sorted(tasks_por_nivel[nivel], key=lambda t: str(t.get("codigo", "")))
+        y_pos = 0.95 - (nivel * y_spacing)
+        n_items = len(tasks_nivel)
+        
+        if n_items == 1:
+            x_positions = [0.5]
+        else:
+            x_start = 0.5 - (n_items - 1) * 0.1
+            x_end = 0.5 + (n_items - 1) * 0.1
+            x_positions = list(np.linspace(x_start, x_end, n_items))
+        
+        for i, t in enumerate(tasks_nivel):
+            cod = str(t.get("codigo", ""))
+            desc = str(t.get("descricao", ""))[:18]
+            x_pos = x_positions[i]
+            pos_map[cod] = (x_pos, y_pos)
+            cores = CORES.get(nivel, CORES[4])
+            
+            shapes.append(dict(type="rect", x0=x_pos-box_width/2, y0=y_pos-box_height/2,
+                               x1=x_pos+box_width/2, y1=y_pos+box_height/2,
+                               fillcolor=cores["fill"], line=dict(color=cores["border"], width=1.5)))
+            
+            annotations.append(dict(x=x_pos, y=y_pos+0.015, text=f"<b>{cod}</b>", showarrow=False,
+                                   font=dict(size=9, color=cores["text"])))
+            annotations.append(dict(x=x_pos, y=y_pos-0.015, text=desc, showarrow=False,
+                                   font=dict(size=8, color=cores["text"])))
+            
+            # Linhas de conexão
+            pai = get_pai(cod)
+            if pai in pos_map:
+                px, py = pos_map[pai]
+                mid_y = (py + y_pos) / 2
+                shapes.append(dict(type="line", x0=px, y0=py-box_height/2, x1=px, y1=mid_y,
+                                   line=dict(color="#666666", width=1, dash="dot")))
+                shapes.append(dict(type="line", x0=px, y0=mid_y, x1=x_pos, y1=mid_y,
+                                   line=dict(color="#666666", width=1, dash="dot")))
+                shapes.append(dict(type="line", x0=x_pos, y0=mid_y, x1=x_pos, y1=y_pos+box_height/2,
+                                   line=dict(color="#666666", width=1, dash="dot")))
 
-    # ── Calcular posições (x,y) por nível ───────────────────
-    # BFS do topo para baixo; x distribuído uniformemente por nó-folha
-    # y = -nível (cresce para baixo)
+    # Indicadores de nível
+    for nivel in range(max(niveis) + 1):
+        y_pos = 0.95 - (nivel * y_spacing)
+        annotations.append(dict(x=0.98, y=y_pos, text=f"<b>Nível {nivel + 1}</b>", showarrow=False,
+                               font=dict(size=10, color="#94a3b8"), xanchor="left"))
+        shapes.append(dict(type="line", x0=0.02, y0=y_pos-box_height/2-0.02, x1=0.98, y1=y_pos-box_height/2-0.02,
+                          line=dict(color="#334155", width=1, dash="dash")))
 
-    def contar_folhas(no):
-        """Conta quantas folhas (sem filhos) existem abaixo de 'no'."""
-        if not filhos.get(no):
-            return 1
-        return sum(contar_folhas(f) for f in filhos[no])
-
-    pos = {}  # cod → (x, y)
-    nivel_map = {"__root__": 0}
-    for t in tasks_sorted:
-        cod = str(t.get("codigo",""))
-        nivel_map[cod] = int(t.get("nivel", len(cod.split("."))))
-
-    def atribuir_posicoes(no, x_start, x_end, depth):
-        cx = (x_start + x_end) / 2.0
-        cy = -depth
-        pos[no] = (cx, cy)
-        children = filhos.get(no, [])
-        if not children:
-            return
-        total_folhas = sum(contar_folhas(c) for c in children)
-        cur = x_start
-        for c in children:
-            w = (contar_folhas(c) / total_folhas) * (x_end - x_start)
-            atribuir_posicoes(c, cur, cur + w, depth + 1)
-            cur += w
-
-    atribuir_posicoes("__root__", 0, 1, 0)
-
-    # ── Construir figura ─────────────────────────────────────
-    fig = go.Figure()
-
-    # Linhas de conexão pai → filho
-    shapes = []
-    for pai_cod, children in filhos.items():
-        if pai_cod not in pos or not children:
-            continue
-        px, py = pos[pai_cod]
-        for c in children:
-            if c not in pos:
-                continue
-            cx, cy = pos[c]
-            # Linha vertical do pai para baixo e horizontal para o filho
-            # (cotovelo estilo PMBOK)
-            mid_y = (py + cy) / 2.0
-            shapes.append(dict(
-                type="line", xref="x", yref="y",
-                x0=px, y0=py - 0.06,   # sai de baixo da caixa pai
-                x1=px, y1=mid_y,
-                line=dict(color="#94a3b8", width=1.5),
-            ))
-            shapes.append(dict(
-                type="line", xref="x", yref="y",
-                x0=px, y0=mid_y,
-                x1=cx, y1=mid_y,
-                line=dict(color="#94a3b8", width=1.5),
-            ))
-            shapes.append(dict(
-                type="line", xref="x", yref="y",
-                x0=cx, y0=mid_y,
-                x1=cx, y1=cy + 0.06,   # chega no topo da caixa filho
-                line=dict(color="#94a3b8", width=1.5),
-            ))
-
-    # Nós (caixas)
-    node_x, node_y, node_text, node_hover = [], [], [], []
-    node_colors, node_borders, node_font_colors = [], [], []
-    box_w, box_h = 0.06, 0.09  # largura/altura relativa das caixas
-
-    for cod, (nx, ny) in pos.items():
-        # Nó raiz: exibir com nome do projeto (nível 0)
-        if cod == "__root__":
-            nome_curto = (nome_projeto or "Projeto")[:28]
-            node_x.append(nx)
-            node_y.append(ny)
-            node_text.append(f"<b>{nome_curto}</b>")
-            node_hover.append(f"<b>Projeto: {nome_projeto}</b><br>Nível 0 — Raiz")
-            node_colors.append("#0f2942")   # azul muito escuro
-            node_borders.append("#1e3a5f")
-            node_font_colors.append("#ffffff")
-            continue
-
-        t = task_map.get(cod, {})
-        desc  = str(t.get("descricao",""))
-        resp  = str(t.get("responsavel","") or "—")
-        nivel = int(t.get("nivel", len(cod.split("."))))
-        perc  = float(t.get("percentual_avanco") or 0)
-        status = str(t.get("status","") or "")
-
-        # Texto da caixa (quebra em 2 linhas)
-        label_top  = cod
-        label_desc = desc[:22] + ("…" if len(desc) > 22 else "")
-        label_resp = f"👤 {resp[:18]}"
-
-        node_x.append(nx)
-        node_y.append(ny)
-        node_text.append(f"<b>{label_top}</b><br>{label_desc}<br>{label_resp}")
-        node_hover.append(
-            f"<b>{cod} — {desc}</b><br>"
-            f"Responsável: {resp}<br>Nível: {nivel}<br>"
-            f"Status: {status}<br>% Avanço: {perc:.0f}%"
-        )
-        node_colors.append(COR_CAIXA.get(nivel, "#4a5568"))
-        node_borders.append(COR_BORDA.get(nivel, "#2d3748"))
-        node_font_colors.append(COR_TEXTO.get(nivel, "#ffffff"))
-
-    # Scatter para os nós (marcadores grandes que simulam caixas)
-    fig.add_trace(go.Scatter(
-        x=node_x, y=node_y,
-        mode="markers+text",
-        marker=dict(
-            size=52,
-            symbol="square",
-            color=node_colors,
-            line=dict(color=node_borders, width=2),
-        ),
-        text=node_text,
-        textposition="middle center",
-        textfont=dict(size=8, color=node_font_colors),
-        hovertext=node_hover,
-        hoverinfo="text",
-        showlegend=False,
-    ))
-
-    # Legenda de níveis
-    for niv, cor in COR_CAIXA.items():
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode="markers",
-            marker=dict(size=12, symbol="square", color=cor),
-            name=f"Nível {niv}",
-            showlegend=True,
-        ))
-
-    # Calcular altura baseada no número de níveis
-    max_nivel = max((int(t.get("nivel", 1)) for t in tasks_sorted), default=2)
-    n_nos = len(tasks_sorted)
-    altura = max(480, 160 * (max_nivel + 1))
-
+    altura = max(400, 120 * (max(niveis) + 2))
+    
     fig.update_layout(
-        title=dict(
-            text="🏗️ EAP — Estrutura Analítica do Projeto (PMBOK)",
-            font=dict(size=15, color="#e2e8f0"),
-        ),
-        shapes=shapes,
-        xaxis=dict(visible=False, range=[-0.05, 1.05]),
-        yaxis=dict(visible=False, range=[-(max_nivel + 0.5), 0.5]),
-        template="plotly_dark",
-        height=altura,
-        margin=dict(l=10, r=10, t=50, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                    xanchor="right", x=1, font=dict(size=11)),
-        paper_bgcolor="rgba(13,27,42,0.0)",
-        plot_bgcolor="rgba(13,27,42,0.0)",
-        hovermode="closest",
+        shapes=shapes, annotations=annotations,
+        xaxis=dict(visible=False, range=[0, 1]),
+        yaxis=dict(visible=False, range=[0.95 - (max(niveis) + 1) * y_spacing - 0.1, 1.05]),
+        template="plotly_dark", height=altura, margin=dict(l=10, r=80, t=30, b=20),
+        paper_bgcolor="rgba(13,27,42,0.0)", plot_bgcolor="rgba(13,27,42,0.0)",
+        title=dict(text="🏗️ EAP — Estrutura Analítica do Projeto (PMBOK)", font=dict(size=15, color="#e2e8f0")),
     )
     return fig
+
+
 
 
 def gerar_organograma_eap_html(eap_tasks, nome_projeto="Projeto"):
@@ -1453,6 +1494,7 @@ tabs = st.tabs(
         "🏠 Home / Resumo",
         "📜 TAP & Requisitos",
         "📦 EAP / Curva S Trabalho",
+        "📊 Gantt",
         "💰 Financeiro / Curva S",
         "📊 Qualidade (KPIs)",
         "⚠️ Riscos",
@@ -1743,19 +1785,20 @@ with tabs[2]:
         with c4:
             responsavel = st.text_input("Responsável", key="eap_resp")
 
-        col_dt1, col_dt2 = st.columns([1.6, 1.6])
-        data_inicio_new = col_dt1.date_input("Data de Início", value=date.today(), key="eap_data_inicio")
+        st.markdown("**Datas Planejadas**")
+        col_dt1, col_dt2 = st.columns(2)
+        data_inicio_new = col_dt1.date_input("Data de Início Planejada", value=date.today(), key="eap_data_inicio")
         try:
             _dur = int(duracao or 0)
         except Exception:
             _dur = 0
         data_conclusao_new = data_inicio_new + timedelta(days=_dur)
-        col_dt2.text_input(
-            "Data de Conclusão (automática)",
-            value=data_conclusao_new.strftime("%Y-%m-%d"),
-            disabled=True, key="eap_data_conclusao",
-            help="Calculada como Data de Início + Duração (dias).",
-        )
+        col_dt2.date_input("Data de Conclusão Planejada (auto)", value=data_conclusao_new, disabled=True, key="eap_data_conclusao")
+        
+        st.markdown("**Datas Reais (preencher durante execução)**")
+        col_dtr1, col_dtr2 = st.columns(2)
+        data_inicio_real_new = col_dtr1.date_input("Data de Início Real", value=None, key="eap_data_inicio_real")
+        data_conclusao_real_new = col_dtr2.date_input("Data de Conclusão Real", value=None, key="eap_data_conclusao_real")
 
         col_pp, col_rel, col_stat = st.columns([2, 1, 1])
         with col_pp:
@@ -1774,19 +1817,22 @@ with tabs[2]:
                 st.warning("Informe código e descrição.")
             else:
                 preds = [x.strip() for x in predecessoras_str.split(",") if x.strip()]
+                nivel_auto = get_nivel_from_codigo(codigo.strip())
                 eapTasks.append({
                     "id": int(datetime.now().timestamp() * 1000),
                     "codigo": codigo.strip(),
                     "descricao": descricao.strip(),
-                    "nivel": int(nivel),
+                    "nivel": nivel_auto,
                     "predecessoras": preds,
                     "responsavel": responsavel.strip(),
                     "duracao": int(duracao),
                     "data_inicio": data_inicio_new.isoformat(),
                     "data_conclusao": data_conclusao_new.isoformat(),
+                    "data_inicio_real": data_inicio_real_new.isoformat() if data_inicio_real_new else "",
+                    "data_conclusao_real": data_conclusao_real_new.isoformat() if data_conclusao_real_new else "",
                     "relacao": relacao,
                     "status": status,
-                    "percentual_avanco": 0,
+                    "percentual_avanco": 100 if status == "concluido" else 0,
                 })
                 salvar_estado()
                 st.success("Atividade adicionada.")
@@ -1796,10 +1842,16 @@ with tabs[2]:
     if eapTasks:
         st.markdown("#### 📋 Tabela de Atividades — edite diretamente e clique em Salvar")
 
-        # Garante campo percentual_avanco em tarefas antigas
+        # Garante campos em tarefas antigas
         for _t in eapTasks:
             if "percentual_avanco" not in _t:
                 _t["percentual_avanco"] = 0
+            if "data_inicio_real" not in _t:
+                _t["data_inicio_real"] = ""
+            if "data_conclusao_real" not in _t:
+                _t["data_conclusao_real"] = ""
+            # Auto-calcula nível pelo código
+            _t["nivel"] = get_nivel_from_codigo(str(_t.get("codigo", "")))
             # auto-calcula % quando status = concluido
             if str(_t.get("status","")) == "concluido" and float(_t.get("percentual_avanco",0)) < 100:
                 _t["percentual_avanco"] = 100
@@ -1815,7 +1867,7 @@ with tabs[2]:
 
         # Selecionar colunas para exibição na tabela editável
         _cols_edit = ["id","codigo","descricao","nivel","duracao","data_inicio","data_conclusao",
-                      "responsavel","predecessoras","relacao","status","percentual_avanco"]
+                      "data_inicio_real","data_conclusao_real","responsavel","predecessoras","relacao","status","percentual_avanco"]
         _cols_exist = [c for c in _cols_edit if c in df_eap_sorted.columns]
         df_edit = df_eap_sorted[_cols_exist].copy()
 
@@ -1826,7 +1878,7 @@ with tabs[2]:
             )
 
         # Converter datas para tipo date (data_editor precisa)
-        for _dc in ["data_inicio", "data_conclusao"]:
+        for _dc in ["data_inicio", "data_conclusao", "data_inicio_real", "data_conclusao_real"]:
             if _dc in df_edit.columns:
                 df_edit[_dc] = pd.to_datetime(df_edit[_dc], errors="coerce").dt.date
 
@@ -1846,7 +1898,9 @@ with tabs[2]:
                 "nivel":       st.column_config.SelectboxColumn("Nível", options=[1,2,3,4], width="small"),
                 "duracao":     st.column_config.NumberColumn("Duração (dias)", min_value=1, step=1, width="small"),
                 "data_inicio": st.column_config.DateColumn("Início", format="DD/MM/YYYY", width="small"),
-                "data_conclusao": st.column_config.DateColumn("Conclusão", format="DD/MM/YYYY", width="small"),
+                "data_conclusao": st.column_config.DateColumn("Conclusão Plan.", format="DD/MM/YYYY", width="small"),
+                "data_inicio_real": st.column_config.DateColumn("Início Real", format="DD/MM/YYYY", width="small"),
+                "data_conclusao_real": st.column_config.DateColumn("Conclusão Real", format="DD/MM/YYYY", width="small"),
                 "responsavel": st.column_config.TextColumn("Responsável", width="medium"),
                 "predecessoras": st.column_config.TextColumn("Predecessoras", width="small",
                                                               help="Códigos separados por vírgula. Ex: 1.1, 1.2"),
@@ -1967,11 +2021,68 @@ with tabs[2]:
         st.warning("Defina a data de início no TAP para gerar Curva S e Gantt.")
 
 
+
+# --------------------------------------------------------
+# TAB 3 - GANTT (NOVA ABA DEDICADA)
+# --------------------------------------------------------
+
+with tabs[3]:
+    st.markdown("### 📊 Gráfico de Gantt")
+    st.caption("Cronograma visual estilo MS Project com planejado e realizado")
+
+    if eapTasks and tap.get("dataInicio"):
+        # Gantt planejado x realizado
+        st.markdown("#### 📊 Gantt — Planejado × Avanço Real")
+        fig_gantt = gerar_gantt(eapTasks, tap["dataInicio"])
+        if fig_gantt:
+            st.plotly_chart(fig_gantt, use_container_width=True, key="gantt_main_tab")
+        else:
+            st.caption("Gantt indisponível — verifique dados da EAP e data de início no TAP.")
+
+        # Identificar atividades atrasadas
+        atrasadas_list = []
+        _is_summary = compute_is_summary(eapTasks)
+        hoje = date.today()
+        for t in eapTasks:
+            cod = str(t.get("codigo", ""))
+            if _is_summary.get(cod, False):
+                continue
+            perc = float(t.get("percentual_avanco") or 0)
+            if perc >= 100:
+                continue
+            dc_str = t.get("data_conclusao") or t.get("data_conclusao_calc")
+            if dc_str:
+                try:
+                    dc = datetime.strptime(dc_str, "%Y-%m-%d").date()
+                    if dc < hoje:
+                        dias_atraso = (hoje - dc).days
+                        atrasadas_list.append({
+                            "Código": cod,
+                            "Descrição": t.get("descricao", "")[:40],
+                            "Conclusão Prev.": dc.strftime("%d/%m/%Y"),
+                            "Dias Atraso": dias_atraso,
+                            "% Avanço": f"{perc:.0f}%",
+                            "Responsável": t.get("responsavel", ""),
+                        })
+                except:
+                    pass
+        
+        if atrasadas_list:
+            st.markdown("#### ⚠️ Atividades Atrasadas")
+            df_atraso = pd.DataFrame(atrasadas_list)
+            st.dataframe(df_atraso, use_container_width=True, height=250)
+        else:
+            st.success("✅ Nenhuma atividade atrasada!")
+            
+    else:
+        st.info("Cadastre atividades na aba EAP e defina a data de início no TAP para visualizar o Gantt.")
+
+
 # --------------------------------------------------------
 # TAB 3 - FINANCEIRO / CURVA S
 # --------------------------------------------------------
 
-with tabs[3]:
+with tabs[4]:
     st.markdown("### 💰 Lançamentos financeiros do projeto")
 
     with st.expander("Adicionar lançamento financeiro", expanded=True):
@@ -2624,7 +2735,7 @@ with tabs[5]:
 # TAB 6 - LIÇÕES
 # --------------------------------------------------------
 
-with tabs[6]:
+with tabs[7]:
     st.markdown("### 🧠 Lições aprendidas")
 
     with st.expander("Registrar lição", expanded=True):
@@ -2687,7 +2798,7 @@ with tabs[6]:
 # TAB 7 - ENCERRAMENTO
 # --------------------------------------------------------
 
-with tabs[7]:
+with tabs[8]:
     st.markdown("### ✅ Encerramento do projeto")
 
     col1__, col2__ = st.columns(2)
@@ -2820,7 +2931,7 @@ def end_of_month(dt: date):
     else:
         return date(dt.year, dt.month + 1, 1) - timedelta(days=1)
 
-with tabs[8]:
+with tabs[9]:
     st.markdown("### 📑 Relatórios em HTML / CSS")
     tipo_rel = st.selectbox("Selecione o relatório",
                             ["Extrato financeiro", "Resumo TAP", "Riscos e Lições", "Relatório completo"],
@@ -3408,8 +3519,9 @@ with tabs[8]:
 # TAB 9 - PLANO DE AÇÃO
 # --------------------------------------------------------
 
-with tabs[9]:
-    st.markdown("### 📌 Plano de Ação")
+with tabs[10]:
+    st.markdown("### 📌 Plano de Ação (5W2H)")
+    st.caption("Gerencie ações corretivas, preventivas e de melhoria do projeto")
 
     with st.expander("Registrar item do plano de ação", expanded=True):
         pa1, pa2, pa3 = st.columns(3)
@@ -3450,16 +3562,60 @@ with tabs[9]:
 
     if action_plan:
         df_ap = pd.DataFrame(action_plan)
-        st.markdown("#### Ações cadastradas")
-        st.dataframe(df_ap, use_container_width=True, height=260)
+        
+        # Métricas
+        total_acoes = len(action_plan)
+        pendentes = sum(1 for a in action_plan if a.get("status") == "pendente")
+        em_andamento = sum(1 for a in action_plan if a.get("status") == "em_andamento")
+        concluidas = sum(1 for a in action_plan if a.get("status") == "concluido")
+        
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Total de Ações", total_acoes)
+        col_m2.metric("Pendentes", pendentes)
+        col_m3.metric("Em Andamento", em_andamento)
+        col_m4.metric("Concluídas", concluidas)
+        
+        st.markdown("#### 📋 Ações cadastradas")
+        st.dataframe(df_ap, use_container_width=True, height=300)
+        
+        # Gráfico de status
+        if total_acoes > 0:
+            fig_status = go.Figure(data=[go.Pie(
+                labels=["Pendente", "Em Andamento", "Concluído", "Cancelado"],
+                values=[
+                    sum(1 for a in action_plan if a.get("status") == "pendente"),
+                    sum(1 for a in action_plan if a.get("status") == "em_andamento"),
+                    sum(1 for a in action_plan if a.get("status") == "concluido"),
+                    sum(1 for a in action_plan if a.get("status") == "cancelado"),
+                ],
+                hole=0.4,
+                marker_colors=["#f59e0b", "#3b82f6", "#22c55e", "#94a3b8"],
+            )])
+            fig_status.update_layout(
+                title="Status das Ações",
+                template="plotly_dark", height=300,
+                paper_bgcolor="rgba(13,27,42,0.0)", plot_bgcolor="rgba(13,27,42,0.0)",
+            )
+            st.plotly_chart(fig_status, use_container_width=True, key="ap_status_chart")
 
-        idx_ap = st.selectbox("Selecione a ação para excluir", options=list(range(len(action_plan))),
+        st.markdown("#### ✏️ Gerenciar ação")
+        idx_ap = st.selectbox("Selecione a ação", options=list(range(len(action_plan))),
                               format_func=lambda i: f"{action_plan[i]['descricao'][:60]} - {action_plan[i]['status']}", key="ap_del_idx")
-        if st.button("Excluir ação selecionada", key="ap_del_btn"):
-            action_plan.pop(idx_ap)
-            salvar_estado()
-            st.success("Ação excluída.")
-            st.rerun()
+        
+        col_btn1, col_btn2, col_btn3 = st.columns(3)
+        with col_btn1:
+            novo_status = st.selectbox("Alterar status", ["pendente", "em_andamento", "concluido", "cancelado"], key="ap_novo_status")
+            if st.button("Atualizar status", key="ap_upd_btn"):
+                action_plan[idx_ap]["status"] = novo_status
+                salvar_estado()
+                st.success("Status atualizado.")
+                st.rerun()
+        with col_btn2:
+            if st.button("🗑️ Excluir ação", key="ap_del_btn"):
+                action_plan.pop(idx_ap)
+                salvar_estado()
+                st.success("Ação excluída.")
+                st.rerun()
     else:
         st.info("Nenhuma ação registrada no plano de ação.")
 
@@ -3467,7 +3623,7 @@ with tabs[9]:
 # -------------------------------------------------
 # ABA: CONTROLE DE PROJETOS (embutido)
 # -------------------------------------------------
-with tabs[10]:
+with tabs[11]:
     st.markdown("### 🗂️ Controle de Projetos (BK x Cliente)")
     pid = int(st.session_state.get("current_project_id") or 0)
     if not pid:
