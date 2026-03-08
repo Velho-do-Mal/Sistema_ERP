@@ -1491,18 +1491,18 @@ def salvar_estado():
 
 tabs = st.tabs(
     [
-        "🏠 Home / Resumo",
-        "📜 TAP & Requisitos",
-        "📦 EAP / Curva S Trabalho",
-        "📊 Gantt",
-        "💰 Financeiro / Curva S",
-        "📊 Qualidade (KPIs)",
-        "⚠️ Riscos",
-        "🧠 Lições Aprendidas",
-        "✅ Encerramento",
-        "📑 Relatórios HTML",
-        "📌 Plano de Ação",
-        "🗂️ Controle de Projetos",
+        "🏠 Home / Resumo",          # 0
+        "📜 TAP & Requisitos",        # 1
+        "📦 EAP / Curva S Trabalho",  # 2
+        "📊 Gantt",                    # 3
+        "💰 Lançamentos Financeiros",  # 4
+        "📈 Financeiro (Análise)",     # 5
+        "📊 Qualidade (KPIs)",         # 6
+        "⚠️ Riscos",                   # 7
+        "🧠 Lições Aprendidas",       # 8
+        "✅ Encerramento",             # 9
+        "📌 Plano de Ação",           # 10
+        "🗂️ Controle de Projetos",   # 11
     ]
 )
 
@@ -1606,6 +1606,379 @@ with tabs[0]:
             )
         else:
             st.caption("Nenhum risco registrado.")
+
+    # ── BOTÃO RELATÓRIO GERAL (substitui a aba Relatórios) ──
+    st.markdown("---")
+    st.markdown("#### 🖨️ Relatório Geral do Projeto")
+    st.caption("Gera um relatório HTML completo para impressão / download com todas as informações do projeto.")
+
+    if st.button("🖨️ Gerar e Baixar Relatório Geral", type="primary", key="btn_relatorio_geral_home"):
+        # ── Dados auxiliares ──
+        qtd_eap = len(eapTasks)
+        qtd_fin = len(finances)
+        qtd_kpi = len(kpis)
+        qtd_risk = len(risks)
+        qtd_les = len(lessons)
+
+        html_eap = build_eap_html_table(eapTasks)
+
+        resumo_fin_html = "<p>Não há lançamentos financeiros cadastrados.</p>"
+        html_fluxo_table = ""
+        df_fluxo_rel = None
+        fig_flux_rel_html = ""
+        diff_html = ""
+        total_previsto_final = 0.0
+        total_realizado_final = 0.0
+        sugestao_fluxo = "Não há lançamentos financeiros."
+        fluxo_por_mes_html = ""
+        financeiro_analise_html = ""
+
+        # ── Gerar curva S financeira ──
+        if finances:
+            try:
+                if eapTasks and tap.get("dataInicio"):
+                    tasks_cpm_r, total_dias_r = calcular_cpm(eapTasks)
+                    data_inicio_dt_r = datetime.strptime(tap["dataInicio"], "%Y-%m-%d").date()
+                    projeto_fim_dt_r = data_inicio_dt_r + timedelta(days=total_dias_r)
+                    meses_r = months_between(data_inicio_dt_r.replace(day=1), projeto_fim_dt_r.replace(day=1))
+                    inicio_mes_str_r = f"{data_inicio_dt_r.year}-{str(data_inicio_dt_r.month).zfill(2)}"
+                    df_fluxo_rel, _ = gerar_curva_s_financeira(finances, inicio_mes_str_r, meses_r)
+                else:
+                    inicio_mes_str_r = f"{datetime.now().year}-{str(datetime.now().month).zfill(2)}"
+                    df_fluxo_rel, _ = gerar_curva_s_financeira(finances, inicio_mes_str_r, 6)
+
+                if df_fluxo_rel is not None and len(df_fluxo_rel):
+                    total_previsto_final = float(df_fluxo_rel["Previsto (acumulado)"].iloc[-1])
+                    total_realizado_final = float(df_fluxo_rel["Realizado (acumulado)"].iloc[-1])
+                    html_fluxo_table = df_fluxo_rel.to_html(index=False, classes="table-report", border=0)
+
+                    fig_flux = go.Figure()
+                    fig_flux.add_trace(go.Scatter(
+                        x=df_fluxo_rel["Mês"], y=df_fluxo_rel["Previsto (acumulado)"],
+                        mode='lines+markers', name='Previsto (acum.)',
+                        line=dict(color='#0d47a1', width=2), marker=dict(size=6)))
+                    fig_flux.add_trace(go.Scatter(
+                        x=df_fluxo_rel["Mês"], y=df_fluxo_rel["Realizado (acumulado)"],
+                        mode='lines+markers', name='Realizado (acum.)',
+                        line=dict(color='#2ecc71', width=2), marker=dict(size=6)))
+                    fig_flux.update_layout(template='plotly_white', height=360, margin=dict(t=30, b=40),
+                                           xaxis_title='Mês', yaxis_title='Valor (R$)')
+                    fig_flux_rel_html = pio.to_html(fig_flux, include_plotlyjs='cdn', full_html=False)
+
+                    prev_vals = df_fluxo_rel["Previsto (acumulado)"].tolist()
+                    real_vals = df_fluxo_rel["Realizado (acumulado)"].tolist()
+                    diff = [p - r for p, r in zip(prev_vals, real_vals)]
+                    color_cat = ['Positivo' if d >= 0 else 'Negativo' for d in diff]
+                    diff_fig = px.bar(x=df_fluxo_rel["Mês"], y=diff, color=color_cat,
+                                      color_discrete_map={'Positivo':'#2ecc71','Negativo':'#e74c3c'},
+                                      labels={'x':'Mês','y':'Dif. Prev - Real'})
+                    diff_fig.update_layout(showlegend=False, template='plotly_white', height=300)
+                    diff_html = pio.to_html(diff_fig, include_plotlyjs='cdn', full_html=False)
+
+                    ratio = (total_realizado_final / total_previsto_final) if total_previsto_final else 0.0
+                    if ratio >= 0.95:
+                        sugestao_fluxo = "Fluxo de caixa saudável: realização próxima ao previsto."
+                    elif ratio >= 0.8:
+                        sugestao_fluxo = "Atenção: realização moderadamente abaixo do previsto."
+                    else:
+                        sugestao_fluxo = "Risco financeiro: realização muito abaixo do previsto."
+            except Exception:
+                sugestao_fluxo = "Não foi possível gerar o fluxo financeiro automaticamente."
+
+        # ── Financeiro Análise (Planejado x Realizado - tabela e gráficos) ──
+        if finances and df_fluxo_rel is not None and len(df_fluxo_rel):
+            try:
+                start_label = df_fluxo_rel["Mês"].iloc[0]
+                end_label = df_fluxo_rel["Mês"].iloc[-1]
+                sy, sm = map(int, start_label.split("-"))
+                ey, em = map(int, end_label.split("-"))
+                inicio_r = date(sy, sm, 1)
+                fim_r = end_of_month(date(ey, em, 1))
+
+                mapa_sai_prev_r = {k: 0.0 for k in df_fluxo_rel["Mês"].tolist()}
+                mapa_sai_real_r = {k: 0.0 for k in df_fluxo_rel["Mês"].tolist()}
+
+                def key_mes_r(d: date):
+                    return f"{d.year}-{str(d.month).zfill(2)}"
+
+                for l in finances:
+                    tipo = l.get("tipo", "Entrada")
+                    try:
+                        valor = float(l.get("valor", 0.0))
+                    except Exception:
+                        valor = 0.0
+                    if tipo == "Saída":
+                        ocorr = expandir_recorrencia(l, inicio_r, fim_r)
+                        for d in ocorr:
+                            k = key_mes_r(d)
+                            if k in mapa_sai_prev_r:
+                                mapa_sai_prev_r[k] += valor
+                        if l.get("realizado") and l.get("dataRealizada"):
+                            try:
+                                dr = datetime.strptime(l["dataRealizada"], "%Y-%m-%d").date()
+                                if inicio_r <= dr <= fim_r:
+                                    k = key_mes_r(dr)
+                                    if k in mapa_sai_real_r:
+                                        mapa_sai_real_r[k] += valor
+                            except Exception:
+                                pass
+
+                months_list = df_fluxo_rel["Mês"].tolist()
+                plan_vals = [mapa_sai_prev_r.get(m, 0.0) for m in months_list]
+                real_vals_c = [mapa_sai_real_r.get(m, 0.0) for m in months_list]
+                diff_vals = [p - r for p, r in zip(plan_vals, real_vals_c)]
+                plan_acum = []
+                real_acum = []
+                pa, ra = 0.0, 0.0
+                for p, r in zip(plan_vals, real_vals_c):
+                    pa += p; ra += r
+                    plan_acum.append(pa); real_acum.append(ra)
+
+                total_plan = sum(plan_vals)
+                total_real_c = sum(real_vals_c)
+                total_diff = total_plan - total_real_c
+                pct_diff = ((total_diff / total_plan) * 100) if total_plan else 0.0
+
+                if abs(pct_diff) <= 5:
+                    parecer_custos = f"✅ Planejamento ASSERTIVO — Diferença de {pct_diff:.1f}% entre custo planejado e realizado."
+                elif pct_diff > 5:
+                    parecer_custos = f"⚠️ Planejamento SUPERESTIMADO — Custo realizado {abs(pct_diff):.1f}% abaixo do planejado. Sobra de orçamento."
+                else:
+                    parecer_custos = f"🔴 Planejamento SUBESTIMADO — Custo realizado {abs(pct_diff):.1f}% acima do planejado. Estouro de orçamento."
+
+                # Tabela
+                df_fin_analise = pd.DataFrame({
+                    "Mês": months_list,
+                    "Planejado (R$)": [format_currency_br(v) for v in plan_vals],
+                    "Realizado (R$)": [format_currency_br(v) for v in real_vals_c],
+                    "Diferença (R$)": [format_currency_br(v) for v in diff_vals],
+                    "Acum. Plan. (R$)": [format_currency_br(v) for v in plan_acum],
+                    "Acum. Real. (R$)": [format_currency_br(v) for v in real_acum],
+                })
+                # Totais
+                df_totais = pd.DataFrame([{
+                    "Mês": "TOTAL",
+                    "Planejado (R$)": format_currency_br(total_plan),
+                    "Realizado (R$)": format_currency_br(total_real_c),
+                    "Diferença (R$)": format_currency_br(total_diff),
+                    "Acum. Plan. (R$)": format_currency_br(plan_acum[-1] if plan_acum else 0),
+                    "Acum. Real. (R$)": format_currency_br(real_acum[-1] if real_acum else 0),
+                }])
+                df_fin_analise_full = pd.concat([df_fin_analise, df_totais], ignore_index=True)
+                fin_analise_table_html = df_fin_analise_full.to_html(index=False, classes="table-report", border=0)
+
+                # Gráfico barras fluxo de caixa
+                fig_fluxo_bar = go.Figure()
+                fig_fluxo_bar.add_trace(go.Bar(x=months_list, y=plan_vals, name='Planejado', marker_color='#3498db', opacity=0.7))
+                fig_fluxo_bar.add_trace(go.Bar(x=months_list, y=real_vals_c, name='Realizado', marker_color='#e74c3c', opacity=0.7))
+                fig_fluxo_bar.update_layout(barmode='group', template='plotly_white', height=340,
+                                             xaxis_title='Mês', yaxis_title='Valor (R$)',
+                                             title='Fluxo de Caixa Mensal — Planejado x Realizado')
+                fluxo_bar_html = pio.to_html(fig_fluxo_bar, include_plotlyjs='cdn', full_html=False)
+
+                # Gráfico linhas acumulado
+                fig_acum_line = go.Figure()
+                fig_acum_line.add_trace(go.Scatter(x=months_list, y=plan_acum, mode='lines+markers',
+                                                    name='Planejado Acumulado', line=dict(color='#0d47a1', width=2)))
+                fig_acum_line.add_trace(go.Scatter(x=months_list, y=real_acum, mode='lines+markers',
+                                                    name='Realizado Acumulado', line=dict(color='#e74c3c', width=2)))
+                fig_acum_line.update_layout(template='plotly_white', height=340,
+                                             xaxis_title='Mês', yaxis_title='Valor Acumulado (R$)',
+                                             title='Custo Acumulado — Planejado x Realizado')
+                acum_line_html = pio.to_html(fig_acum_line, include_plotlyjs='cdn', full_html=False)
+
+                financeiro_analise_html = f"""
+                <h3 class="section-title">Análise Financeira — Planejado x Realizado (Custos)</h3>
+                <p class="small-note"><strong>Parecer:</strong> {parecer_custos}</p>
+                <h4 class="section-title">Tabela de Custos Mensal</h4>
+                {fin_analise_table_html}
+                <h4 class="section-title" style="margin-top:14px;">Fluxo de Caixa Mensal (Barras)</h4>
+                <div>{fluxo_bar_html}</div>
+                <h4 class="section-title" style="margin-top:14px;">Custo Acumulado (Linhas)</h4>
+                <div>{acum_line_html}</div>
+                """
+            except Exception:
+                financeiro_analise_html = "<p>Não foi possível gerar a análise financeira detalhada.</p>"
+
+        # ── KPIs ──
+        kpi_table_html = "<p>Não há KPIs cadastrados.</p>"
+        kpi_plot_html = ""
+        sugestao_kpi = ""
+        if kpis:
+            try:
+                df_k_all = pd.DataFrame(kpis).copy()
+                df_k_all["Diferença"] = df_k_all["realizado"] - df_k_all["previsto"]
+                df_k_show = df_k_all[["nome", "unidade", "mes", "previsto", "realizado", "Diferença"]].copy()
+                df_k_show.columns = ["Nome", "Unidade", "Mês", "Previsto", "Realizado", "Diferença"]
+                df_k_show["Previsto"] = df_k_show["Previsto"].map(lambda x: f"{x:.2f}")
+                df_k_show["Realizado"] = df_k_show["Realizado"].map(lambda x: f"{x:.2f}")
+                df_k_show["Diferença"] = df_k_show["Diferença"].map(lambda x: f"{x:.2f}")
+                kpi_table_html = df_k_show.to_html(index=False, classes="table-report", border=0)
+
+                kpi_names_r = list({k["nome"] for k in kpis})
+                kpi_sel_auto_r = kpi_names_r[0]
+                serie_r = sorted([k for k in kpis if k["nome"] == kpi_sel_auto_r], key=lambda x: x["mes"])
+                meses_k = [f"M{p['mes']}" for p in serie_r]
+                previstos_k = [p["previsto"] for p in serie_r]
+                realizados_k = [p["realizado"] for p in serie_r]
+
+                figk = go.Figure()
+                figk.add_trace(go.Scatter(x=meses_k, y=previstos_k, mode='lines+markers', name='Previsto', line=dict(color='#0d47a1')))
+                figk.add_trace(go.Scatter(x=meses_k, y=realizados_k, mode='lines+markers', name='Realizado', line=dict(color='#2ecc71')))
+                figk.update_layout(template='plotly_white', height=340, margin=dict(t=30), yaxis_title='Valor')
+                kpi_plot_html = pio.to_html(figk, include_plotlyjs='cdn', full_html=False)
+
+                ratios_k = []
+                for pv, rl in zip(previstos_k, realizados_k):
+                    try:
+                        if pv and pv != 0:
+                            ratios_k.append(rl / pv)
+                    except Exception:
+                        continue
+                avg_ratio_k = sum(ratios_k) / len(ratios_k) if ratios_k else 0.0
+                if avg_ratio_k >= 0.95:
+                    sugestao_kpi = "Desempenho do KPI muito bom — metas sendo atingidas."
+                elif avg_ratio_k >= 0.8:
+                    sugestao_kpi = "KPI aceitável, mas atenção às variações mensais."
+                else:
+                    sugestao_kpi = "KPI abaixo do esperado — investigar causas."
+            except Exception:
+                pass
+
+        # ── Riscos e Plano de Ação ──
+        risks_html_r = "<p>Não há riscos cadastrados.</p>"
+        if risks:
+            df_r_show = pd.DataFrame(risks)[["descricao","impacto","prob","indice","resposta"]].copy()
+            df_r_show.columns = ["Risco","Impacto","Probabilidade","Índice","Resposta"]
+            risks_html_r = df_r_show.to_html(index=False, classes="table-report", border=0)
+        action_html_r = "<p>Não há ações no plano.</p>"
+        if action_plan:
+            df_ap_r = pd.DataFrame(action_plan)[["descricao","responsavel","status","prazo","risco_relacionado"]].copy()
+            df_ap_r.columns = ["Ação","Responsável","Status","Prazo","Risco relacionado"]
+            action_html_r = df_ap_r.to_html(index=False, classes="table-report", border=0)
+
+        # ── Gantt ──
+        gantt_html_r = "<p>Gantt indisponível — defina EAP e data de início.</p>"
+        try:
+            if eapTasks and tap.get("dataInicio"):
+                fig_gantt_r = gerar_gantt(eapTasks, tap["dataInicio"])
+                if fig_gantt_r:
+                    gantt_html_r = pio.to_html(fig_gantt_r, include_plotlyjs="cdn", full_html=False)
+        except Exception:
+            gantt_html_r = "<p>Erro ao gerar Gantt.</p>"
+
+        lessons_html_r = (pd.DataFrame(lessons)[['titulo','fase','categoria','descricao','recomendacao']].to_html(index=False, classes='table-report') if lessons else '<p>Não há lições registradas.</p>')
+        org_html_r = gerar_organograma_eap_html(eapTasks, nome_projeto=tap.get("nome") or "Projeto")
+
+        curva_s_html_r = "<p>Curva S indisponível.</p>"
+        try:
+            if eapTasks and tap.get("dataInicio"):
+                fig_cs_r = gerar_curva_s_trabalho(eapTasks, tap["dataInicio"])
+                if fig_cs_r:
+                    curva_s_html_r = pio.to_html(fig_cs_r, include_plotlyjs="cdn", full_html=False)
+        except Exception:
+            pass
+
+        # ── Montar HTML completo ──
+        html_corpo_r = f"""
+        <div class="container">
+          <div class="header">
+            <div>
+                <div class="title">Relatório Completo do Projeto</div>
+                <div class="subtitle">Projeto: {tap.get('nome','')} — ID {st.session_state.current_project_id}</div>
+            </div>
+            <div class="badge">Relatório Completo</div>
+          </div>
+
+          <div style="padding:18px;">
+            <h3 class="section-title">1. Identificação e TAP</h3>
+            <p><strong>Gerente:</strong> {tap.get('gerente','')} &nbsp;&nbsp; <strong>Patrocinador:</strong> {tap.get('patrocinador','')}</p>
+            <p><strong>Data de início:</strong> {tap.get('dataInicio','')} &nbsp;&nbsp; <strong>Status:</strong> {tap.get('status','rascunho')}</p>
+
+            <h3 class="section-title">2. Objetivo e Escopo</h3>
+            <p><strong>Objetivo:</strong><br>{tap.get('objetivo','').replace(chr(10),'<br>')}</p>
+            <p><strong>Escopo inicial:</strong><br>{tap.get('escopo','').replace(chr(10),'<br>')}</p>
+
+            <h3 class="section-title">3. Resumo de números</h3>
+            <div class="report-grid">
+                <div class="report-card"><strong>Atividades na EAP</strong><div style="margin-top:8px">{qtd_eap}</div></div>
+                <div class="report-card"><strong>Lançamentos financeiros</strong><div style="margin-top:8px">{qtd_fin}</div></div>
+                <div class="report-card"><strong>Pontos de KPI</strong><div style="margin-top:8px">{qtd_kpi}</div></div>
+                <div class="report-card"><strong>Riscos</strong><div style="margin-top:8px">{qtd_risk}</div></div>
+                <div class="report-card"><strong>Lições</strong><div style="margin-top:8px">{qtd_les}</div></div>
+            </div>
+
+            <h3 class="section-title">4. Estrutura Analítica do Projeto (EAP)</h3>
+            <h4 class="section-title">4.1 Organograma Hierárquico (PMBOK)</h4>
+            <div>{org_html_r}</div>
+            <h4 class="section-title" style="margin-top:14px;">4.2 Tabela da EAP</h4>
+            {html_eap}
+
+            <h3 class="section-title">5. Cronograma e Avanço Físico</h3>
+            <h4 class="section-title">5.1 Curva S de Trabalho — Planejado × Realizado</h4>
+            <div>{curva_s_html_r}</div>
+            <h4 class="section-title" style="margin-top:14px;">5.2 Gráfico de Gantt</h4>
+            <div>{gantt_html_r}</div>
+
+            <h3 class="section-title">6. Resultados Financeiros (Previsto x Realizado)</h3>
+            <div class="report-grid">
+                <div class="report-card">
+                    <strong>Resumo financeiro</strong>
+                    <div style="margin-top:8px;">Total Previsto (acum): <strong>{format_currency_br(total_previsto_final)}</strong><br>
+                    Total Realizado (acum): <strong>{format_currency_br(total_realizado_final)}</strong><br>
+                    Saldo: <strong>{format_currency_br(total_previsto_final - total_realizado_final)}</strong></div>
+                </div>
+                <div class="report-card">
+                    <strong>Análise rápida do fluxo</strong>
+                    <p class="small-note">{sugestao_fluxo}</p>
+                </div>
+            </div>
+
+            <div style="margin-top:12px;">
+              <h4 class="section-title">Curva S Financeira</h4>
+              <div class="report-grid">
+                <div class="report-card">{fig_flux_rel_html}</div>
+                <div class="report-card">{diff_html}</div>
+              </div>
+            </div>
+
+            {financeiro_analise_html}
+
+            <h3 class="section-title" style="margin-top:10px;">7. KPIs (Previstos x Realizados)</h3>
+            <div class="report-grid">
+                <div class="report-card">
+                    <strong>Tabela de KPIs</strong>
+                    <div style="margin-top:8px;">{kpi_table_html}</div>
+                </div>
+                <div class="report-card">
+                    <strong>Gráfico KPI principal</strong>
+                    <div style="margin-top:8px;">{kpi_plot_html}</div>
+                    <p class="small-note">{sugestao_kpi}</p>
+                </div>
+            </div>
+
+            <h3 class="section-title">8. Riscos</h3>
+            {risks_html_r}
+
+            <h3 class="section-title">9. Plano de Ação</h3>
+            {action_html_r}
+
+            <h3 class="section-title">10. Lições Aprendidas</h3>
+            {lessons_html_r}
+
+            <h3 class="section-title">11. Encerramento</h3>
+            <p><strong>Resumo executivo:</strong><br>{close_data.get('resumo','').replace(chr(10),'<br>')}</p>
+            <p><strong>Resultados alcançados:</strong><br>{close_data.get('resultados','').replace(chr(10),'<br>')}</p>
+
+          </div>
+          <div class="footer">Relatório gerado em {datetime.now().strftime("%d/%m/%Y %H:%M")} — BK Engenharia</div>
+        </div>
+        """
+
+        html_completo_r = montar_html_completo(html_corpo_r)
+        st.download_button("⬇️ Baixar relatório completo em HTML", data=html_completo_r.encode("utf-8"),
+                            file_name="relatorio_completo_projeto.html", mime="text/html", key="dl_relatorio_geral_home")
+        components.html(REPORT_CSS + html_corpo_r, height=1100, scrolling=True)
 
 
 # --------------------------------------------------------
@@ -2424,10 +2797,10 @@ with tabs[4]:
 
 
 # --------------------------------------------------------
-# TAB 4 - KPIs
+# TAB 6 - KPIs
 # --------------------------------------------------------
 
-with tabs[4]:
+with tabs[6]:
     st.markdown("### 📊 KPIs de Qualidade")
 
     with st.expander("Registrar ponto de KPI", expanded=True):
@@ -2585,10 +2958,10 @@ with tabs[4]:
 
 
 # --------------------------------------------------------
-# TAB 5 - RISCOS
+# TAB 7 - RISCOS
 # --------------------------------------------------------
 
-with tabs[5]:
+with tabs[7]:
     st.markdown("### ⚠️ Registro de riscos")
 
     def peso_impacto(impacto):
@@ -2732,10 +3105,10 @@ with tabs[5]:
 
 
 # --------------------------------------------------------
-# TAB 6 - LIÇÕES
+# TAB 8 - LIÇÕES
 # --------------------------------------------------------
 
-with tabs[7]:
+with tabs[8]:
     st.markdown("### 🧠 Lições aprendidas")
 
     with st.expander("Registrar lição", expanded=True):
@@ -2795,10 +3168,10 @@ with tabs[7]:
 
 
 # --------------------------------------------------------
-# TAB 7 - ENCERRAMENTO
+# TAB 9 - ENCERRAMENTO
 # --------------------------------------------------------
 
-with tabs[8]:
+with tabs[9]:
     st.markdown("### ✅ Encerramento do projeto")
 
     col1__, col2__ = st.columns(2)
@@ -2931,590 +3304,159 @@ def end_of_month(dt: date):
     else:
         return date(dt.year, dt.month + 1, 1) - timedelta(days=1)
 
-with tabs[9]:
-    st.markdown("### 📑 Relatórios em HTML / CSS")
-    tipo_rel = st.selectbox("Selecione o relatório",
-                            ["Extrato financeiro", "Resumo TAP", "Riscos e Lições", "Relatório completo"],
-                            index=0)
+# --------------------------------------------------------
+# TAB 5 - FINANCEIRO (ANÁLISE) - Planejado x Realizado
+# --------------------------------------------------------
 
-    df_fin = pd.DataFrame(finances) if finances else pd.DataFrame()
-    df_r = pd.DataFrame(risks) if risks else pd.DataFrame()
-    df_l = pd.DataFrame(lessons) if lessons else pd.DataFrame()
-    df_eap_rel = pd.DataFrame(eapTasks) if eapTasks else pd.DataFrame()
+with tabs[5]:
+    st.markdown("### 📈 Análise Financeira — Planejado × Realizado")
+    st.caption("Tabela comparativa estilo Excel, fluxo de caixa em barras e custo acumulado em linhas.")
 
-    # --------------------- Extrato Financeiro ---------------------
-    if tipo_rel == "Extrato financeiro":
-        if df_fin.empty:
-            st.info("Não há lançamentos financeiros para gerar o extrato.")
-        else:
-            if "qtdRecorrencias" not in df_fin.columns:
-                df_fin["qtdRecorrencias"] = 1
-            for col in ["categoria", "subcategoria", "dataPrevista", "dataRealizada", "realizado", "tipo"]:
-                if col not in df_fin.columns:
-                    df_fin[col] = (False if col == "realizado" else "")
-            df_fin["Valor"] = (df_fin["valor"] * df_fin["qtdRecorrencias"]).map(format_currency_br)
-            df_fin["Prevista"] = df_fin["dataPrevista"]
-            df_fin["Realizada"] = df_fin["dataRealizada"].replace("", "-")
-            df_fin["Status"] = df_fin["realizado"].map(lambda x: "Realizado" if x else "Pendente")
-            df_fin["Tipo"] = df_fin["tipo"]
-            df_fin["Categoria"] = df_fin["categoria"]
-            df_fin["Subcategoria"] = df_fin["subcategoria"]
+    if finances:
+        # ── Determinar período ──
+        c_per1, c_per2 = st.columns(2)
+        with c_per1:
+            inicio_analise = st.text_input(
+                "Início do período (AAAA-MM)",
+                value=f"{datetime.now().year}-{str(datetime.now().month).zfill(2)}",
+                key="fin_analise_inicio",
+            )
+        with c_per2:
+            meses_analise = st.number_input(
+                "Número de meses", min_value=1, max_value=36, value=12, key="fin_analise_meses"
+            )
 
-            df_show = df_fin[["Tipo", "descricao", "Categoria", "Subcategoria", "Valor", "Prevista", "Realizada", "Status"]].copy()
-            df_show.columns = ["Tipo", "Descrição", "Categoria", "Subcategoria", "Valor", "Prevista", "Realizada", "Status"]
-            html_tabela = df_show.to_html(index=False, classes="table-report", border=0, justify="left")
-
-            total_entradas = (df_fin[df_fin["Tipo"] == "Entrada"]["valor"] * df_fin[df_fin["Tipo"] == "Entrada"]["qtdRecorrencias"]).sum()
-            total_saidas = (df_fin[df_fin["Tipo"] == "Saída"]["valor"] * df_fin[df_fin["Tipo"] == "Saída"]["qtdRecorrencias"]).sum()
-            saldo = total_entradas - total_saidas
-
-            # gráfico entradas x saídas (totais)
-            fig_totals = go.Figure()
-            fig_totals.add_trace(go.Bar(
-                x=["Entradas", "Saídas"],
-                y=[total_entradas, total_saidas],
-                marker_color=['#2ecc71', '#e74c3c'],
-            ))
-            fig_totals.update_layout(template='plotly_white', height=320, margin=dict(t=30, b=20),
-                                     yaxis_tickformat=",.2f")
-            fig_totals.update_yaxes(title_text='Valor (R$)')
-            totals_html = pio.to_html(fig_totals, include_plotlyjs='cdn', full_html=False)
-
-            html_corpo = f"""
-            <div class="container">
-              <div class="header">
-                <div>
-                    <div class="title">Extrato Financeiro do Projeto</div>
-                    <div class="subtitle">Projeto: {tap.get('nome','')} — Gerente: {tap.get('gerente','')}</div>
-                </div>
-                <div class="badge">Relatório Financeiro</div>
-              </div>
-              <div style="padding:18px;">
-                <h3 class="section-title">Resumo financeiro</h3>
-                <div class="report-grid">
-                    <div class="report-card"><strong>Total Entradas</strong><div style="margin-top:10px">{format_currency_br(total_entradas)}</div></div>
-                    <div class="report-card"><strong>Total Saídas</strong><div style="margin-top:10px">{format_currency_br(total_saidas)}</div></div>
-                    <div class="report-card"><strong>Saldo</strong><div style="margin-top:10px">{format_currency_br(saldo)}</div></div>
-                </div>
-                <h3 class="section-title" style="margin-top:16px;">Gráfico Entradas x Saídas</h3>
-                <div>{totals_html}</div>
-                <h3 class="section-title" style="margin-top:16px;">Lançamentos detalhados</h3>
-                {html_tabela}
-              </div>
-              <div class="footer">Relatório gerado em {datetime.now().strftime("%d/%m/%Y %H:%M")}</div>
-            </div>
-            """
-            components.html(REPORT_CSS + html_corpo, height=820, scrolling=True)
-            html_completo = montar_html_completo(html_corpo)
-            st.download_button("⬇️ Baixar relatório em HTML", data=html_completo.encode("utf-8"),
-                                file_name="relatorio_extrato_financeiro.html", mime="text/html")
-
-    # --------------------- Resumo TAP ---------------------
-    elif tipo_rel == "Resumo TAP":
-        html_corpo = f"""
-        <div class="container">
-          <div class="header">
-            <div>
-                <div class="title">Resumo do Termo de Abertura do Projeto (TAP)</div>
-                <div class="subtitle">Projeto ID: {st.session_state.current_project_id}</div>
-            </div>
-            <div class="badge">Resumo TAP</div>
-          </div>
-          <div style="padding:18px;">
-            <h3 class="section-title">Identificação</h3>
-            <p><strong>Nome:</strong> {tap.get('nome','')}</p>
-            <p><strong>Gerente:</strong> {tap.get('gerente','')}</p>
-            <p><strong>Patrocinador:</strong> {tap.get('patrocinador','')}</p>
-            <p><strong>Data de início:</strong> {tap.get('dataInicio','')}</p>
-            <p><strong>Status:</strong> {tap.get('status','rascunho')}</p>
-            <h3 class="section-title">Objetivo</h3>
-            <p>{tap.get('objetivo','').replace(chr(10),'<br>')}</p>
-            <h3 class="section-title">Escopo inicial</h3>
-            <p>{tap.get('escopo','').replace(chr(10),'<br>')}</p>
-          </div>
-          <div class="footer">Relatório gerado em {datetime.now().strftime("%d/%m/%Y %H:%M")}</div>
-        </div>
-        """
-        components.html(REPORT_CSS + html_corpo, height=700, scrolling=True)
-        html_completo = montar_html_completo(html_corpo)
-        st.download_button("⬇️ Baixar relatório em HTML", data=html_completo.encode("utf-8"),
-                            file_name="relatorio_resumo_tap.html", mime="text/html")
-
-    # --------------------- Riscos e Lições ---------------------
-    elif tipo_rel == "Riscos e Lições":
-        if not df_r.empty:
-            df_r_show = df_r[["descricao","impacto","prob","indice","resposta"]].copy()
-            df_r_show.columns = ["Risco","Impacto","Probabilidade","Índice","Resposta"]
-            html_riscos = df_r_show.to_html(index=False, classes="table-report", border=0, justify="left")
-        else:
-            html_riscos = "<p>Não há riscos cadastrados.</p>"
-
-        if not df_l.empty:
-            df_l_show = df_l[["titulo","fase","categoria","descricao","recomendacao"]].copy()
-            df_l_show.columns = ["Título","Fase","Categoria","Lição","Recomendação"]
-            html_licoes = df_l_show.to_html(index=False, classes="table-report", border=0, justify="left")
-        else:
-            html_licoes = "<p>Não há lições registradas.</p>"
-
-        html_corpo = f"""
-        <div class="container">
-          <div class="header">
-            <div>
-                <div class="title">Riscos e Lições Aprendidas</div>
-                <div class="subtitle">Projeto: {tap.get('nome','')}</div>
-            </div>
-            <div class="badge">Riscos & Lições</div>
-          </div>
-          <div style="padding:18px;">
-            <h3 class="section-title">Riscos mapeados</h3>
-            {html_riscos}
-            <h3 class="section-title">Lições aprendidas</h3>
-            {html_licoes}
-          </div>
-          <div class="footer">Relatório gerado em {datetime.now().strftime("%d/%m/%Y %H:%M")}</div>
-        </div>
-        """
-        components.html(REPORT_CSS + html_corpo, height=700, scrolling=True)
-        html_completo = montar_html_completo(html_corpo)
-        st.download_button("⬇️ Baixar relatório em HTML", data=html_completo.encode("utf-8"),
-                            file_name="relatorio_riscos_licoes.html", mime="text/html")
-
-    # --------------------- Relatório completo ---------------------
-    else:
-        qtd_eap = len(eapTasks)
-        qtd_fin = len(finances)
-        qtd_kpi = len(kpis)
-        qtd_risk = len(risks)
-        qtd_les = len(lessons)
-
-        html_eap = build_eap_html_table(eapTasks)
-
-        resumo_fin_html = "<p>Não há lançamentos financeiros cadastrados.</p>"
-        html_fluxo_table = "<p>Gráfico completo exibido abaixo no aplicativo (interativo).</p>"
-        df_fluxo_rel = None
-        fig_fluxo_rel = None
-        total_previsto_final = 0.0
-        total_realizado_final = 0.0
-
-        # gerar curva S financeira (quando possível)
-        if finances:
+        if st.button("📊 Gerar Análise Financeira", type="primary", key="btn_gerar_analise_fin"):
             try:
-                if eapTasks and tap.get("dataInicio"):
-                    tasks_cpm, total_dias = calcular_cpm(eapTasks)
-                    data_inicio_dt = datetime.strptime(tap["dataInicio"], "%Y-%m-%d").date()
-                    projeto_fim_dt = data_inicio_dt + timedelta(days=total_dias)
-                    meses = months_between(data_inicio_dt.replace(day=1), projeto_fim_dt.replace(day=1))
-                    inicio_mes_str = f"{data_inicio_dt.year}-{str(data_inicio_dt.month).zfill(2)}"
-                    df_fluxo_rel, _ = gerar_curva_s_financeira(finances, inicio_mes_str, meses)
-                else:
-                    inicio_mes_str = f"{datetime.now().year}-{str(datetime.now().month).zfill(2)}"
-                    df_fluxo_rel, _ = gerar_curva_s_financeira(finances, inicio_mes_str, 6)
+                df_fluxo_an, _ = gerar_curva_s_financeira(finances, inicio_analise, int(meses_analise))
 
-                # Construir gráfico com cores definidas para Previsto/Realizado
-                if df_fluxo_rel is not None and len(df_fluxo_rel):
-                    total_previsto_final = float(df_fluxo_rel["Previsto (acumulado)"].iloc[-1])
-                    total_realizado_final = float(df_fluxo_rel["Realizado (acumulado)"].iloc[-1])
-                    html_fluxo_table = df_fluxo_rel.to_html(index=False, classes="table-report", border=0)
+                if df_fluxo_an is not None and len(df_fluxo_an):
+                    start_label = df_fluxo_an["Mês"].iloc[0]
+                    end_label = df_fluxo_an["Mês"].iloc[-1]
+                    sy, sm = map(int, start_label.split("-"))
+                    ey, em = map(int, end_label.split("-"))
+                    inicio_an = date(sy, sm, 1)
+                    fim_an = end_of_month(date(ey, em, 1))
 
-                    # construir figura custom para prev/real com cores claras
-                    fig_flux = go.Figure()
-                    fig_flux.add_trace(go.Scatter(
-                        x=df_fluxo_rel["Mês"],
-                        y=df_fluxo_rel["Previsto (acumulado)"],
-                        mode='lines+markers',
-                        name='Previsto (acum.)',
-                        line=dict(color='#0d47a1', width=2),
-                        marker=dict(size=6)
-                    ))
-                    fig_flux.add_trace(go.Scatter(
-                        x=df_fluxo_rel["Mês"],
-                        y=df_fluxo_rel["Realizado (acumulado)"],
-                        mode='lines+markers',
-                        name='Realizado (acum.)',
-                        line=dict(color='#2ecc71', width=2),
-                        marker=dict(size=6)
-                    ))
-                    fig_flux.update_layout(template='plotly_white', height=360, margin=dict(t=30, b=40),
-                                           xaxis_title='Mês', yaxis_title='Valor (R$)')
-                    fig_flux_rel_html = pio.to_html(fig_flux, include_plotlyjs='cdn', full_html=False)
+                    mapa_custo_prev = {k: 0.0 for k in df_fluxo_an["Mês"].tolist()}
+                    mapa_custo_real = {k: 0.0 for k in df_fluxo_an["Mês"].tolist()}
 
-                    # Diferença prev - real (barras)
-                    prev_vals = df_fluxo_rel["Previsto (acumulado)"].tolist()
-                    real_vals = df_fluxo_rel["Realizado (acumulado)"].tolist()
-                    diff = [p - r for p, r in zip(prev_vals, real_vals)]
-                    color_cat = ['Positivo' if d >= 0 else 'Negativo' for d in diff]
-                    diff_fig = px.bar(x=df_fluxo_rel["Mês"], y=diff, color=color_cat,
-                                      color_discrete_map={'Positivo':'#2ecc71','Negativo':'#e74c3c'},
-                                      labels={'x':'Mês','y':'Dif. Prev - Real'})
-                    diff_fig.update_layout(showlegend=False, template='plotly_white', height=300)
-                    diff_html = pio.to_html(diff_fig, include_plotlyjs='cdn', full_html=False)
+                    def key_mes_an(d: date):
+                        return f"{d.year}-{str(d.month).zfill(2)}"
 
-                    ratio = (total_realizado_final / total_previsto_final) if total_previsto_final else 0.0
-                    if ratio >= 0.95:
-                        sugestao_fluxo = "Fluxo de caixa saudável: realização próxima ao previsto."
-                    elif ratio >= 0.8:
-                        sugestao_fluxo = "Atenção: realização moderadamente abaixo do previsto. Verificar pagamentos/consumo."
-                    else:
-                        sugestao_fluxo = "Risco financeiro: realização muito abaixo do previsto. Revisar custos/cronograma."
-                else:
-                    fig_flux_rel_html = ""
-                    diff_html = ""
-                    sugestao_fluxo = "Não foi possível gerar o fluxo financeiro automaticamente."
-            except Exception:
-                fig_flux_rel_html = ""
-                diff_html = ""
-                sugestao_fluxo = "Não foi possível gerar o fluxo financeiro automaticamente. Verifique os dados."
-        else:
-            fig_flux_rel_html = ""
-            diff_html = ""
-            sugestao_fluxo = "Não há lançamentos financeiros."
-
-        # Criar gráfico mensal por tipo (Entrada vs Saída) com as mesmas cores
-        fluxo_por_mes_html = ""
-        if df_fluxo_rel is not None and len(df_fluxo_rel) and finances:
-            try:
-                # Definir periodo
-                start_label = df_fluxo_rel["Mês"].iloc[0]
-                end_label = df_fluxo_rel["Mês"].iloc[-1]
-                sy, sm = map(int, start_label.split("-"))
-                ey, em = map(int, end_label.split("-"))
-                inicio = date(sy, sm, 1)
-                fim = end_of_month(date(ey, em, 1))
-
-                mapa_entr_prev = {k: 0.0 for k in df_fluxo_rel["Mês"].tolist()}
-                mapa_sai_prev = {k: 0.0 for k in df_fluxo_rel["Mês"].tolist()}
-                mapa_entr_real = {k: 0.0 for k in df_fluxo_rel["Mês"].tolist()}
-                mapa_sai_real = {k: 0.0 for k in df_fluxo_rel["Mês"].tolist()}
-
-                def key_mes(d: date):
-                    return f"{d.year}-{str(d.month).zfill(2)}"
-
-                for l in finances:
-                    tipo = l.get("tipo", "Entrada")
-                    try:
-                        valor = float(l.get("valor", 0.0))
-                    except Exception:
-                        valor = 0.0
-                    ocorr = expandir_recorrencia(l, inicio, fim)
-                    for d in ocorr:
-                        k = key_mes(d)
-                        if tipo == "Entrada":
-                            mapa_entr_prev[k] += valor
-                        else:
-                            mapa_sai_prev[k] += valor
-                    if l.get("realizado") and l.get("dataRealizada"):
+                    for l in finances:
+                        tipo = l.get("tipo", "Entrada")
                         try:
-                            dr = datetime.strptime(l["dataRealizada"], "%Y-%m-%d").date()
-                            if inicio <= dr <= fim:
-                                k = key_mes(dr)
-                                if tipo == "Entrada":
-                                    mapa_entr_real[k] += valor
-                                else:
-                                    mapa_sai_real[k] += valor
+                            valor = float(l.get("valor", 0.0))
                         except Exception:
-                            pass
+                            valor = 0.0
+                        if tipo == "Saída":
+                            ocorr = expandir_recorrencia(l, inicio_an, fim_an)
+                            for d in ocorr:
+                                k = key_mes_an(d)
+                                if k in mapa_custo_prev:
+                                    mapa_custo_prev[k] += valor
+                            if l.get("realizado") and l.get("dataRealizada"):
+                                try:
+                                    dr = datetime.strptime(l["dataRealizada"], "%Y-%m-%d").date()
+                                    if inicio_an <= dr <= fim_an:
+                                        k = key_mes_an(dr)
+                                        if k in mapa_custo_real:
+                                            mapa_custo_real[k] += valor
+                                except Exception:
+                                    pass
 
-                # montar df
-                months = df_fluxo_rel["Mês"].tolist()
-                df_mt = pd.DataFrame({
-                    "Mês": months,
-                    "Entrada Previsto": [mapa_entr_prev[k] for k in months],
-                    "Saída Previsto": [mapa_sai_prev[k] for k in months],
-                    "Entrada Realizado": [mapa_entr_real[k] for k in months],
-                    "Saída Realizado": [mapa_sai_real[k] for k in months],
-                })
-                # gráfico agrupado por tipo e status (prev/real)
-                fig_type = go.Figure()
-                fig_type.add_trace(go.Bar(x=df_mt["Mês"], y=df_mt["Entrada Previsto"], name='Entrada Previsto', marker_color='#2ecc71', opacity=0.6))
-                fig_type.add_trace(go.Bar(x=df_mt["Mês"], y=df_mt["Entrada Realizado"], name='Entrada Realizado', marker_color='#27ae60'))
-                fig_type.add_trace(go.Bar(x=df_mt["Mês"], y=df_mt["Saída Previsto"], name='Saída Previsto', marker_color='#f39c12', opacity=0.6))
-                fig_type.add_trace(go.Bar(x=df_mt["Mês"], y=df_mt["Saída Realizado"], name='Saída Realizado', marker_color='#e74c3c'))
-                fig_type.update_layout(barmode='group', template='plotly_white', height=360, legend_title_text='Séries')
-                fluxo_por_mes_html = pio.to_html(fig_type, include_plotlyjs='cdn', full_html=False)
-            except Exception:
-                fluxo_por_mes_html = ""
-        else:
-            fluxo_por_mes_html = ""
+                    months_an = df_fluxo_an["Mês"].tolist()
+                    plan_vals = [mapa_custo_prev.get(m, 0.0) for m in months_an]
+                    real_vals = [mapa_custo_real.get(m, 0.0) for m in months_an]
+                    diff_vals = [p - r for p, r in zip(plan_vals, real_vals)]
+                    plan_acum, real_acum = [], []
+                    pa, ra = 0.0, 0.0
+                    for p, r in zip(plan_vals, real_vals):
+                        pa += p; ra += r
+                        plan_acum.append(pa); real_acum.append(ra)
 
-        # KPIs: tabela com diferença e gráfico (cores Previsto azul / Realizado verde)
-        kpi_table_html = "<p>Não há KPIs cadastrados.</p>"
-        kpi_plot_html = ""
-        sugestao_kpi = ""
-        if kpis:
-            try:
-                df_k_all = pd.DataFrame(kpis).copy()
-                df_k_all["Diferença"] = df_k_all["realizado"] - df_k_all["previsto"]
-                # tabela
-                df_k_show = df_k_all[["nome", "unidade", "mes", "previsto", "realizado", "Diferença"]].copy()
-                df_k_show.columns = ["Nome", "Unidade", "Mês", "Previsto", "Realizado", "Diferença"]
-                # formatar valores numéricos
-                df_k_show["Previsto"] = df_k_show["Previsto"].map(lambda x: f"{x:.2f}")
-                df_k_show["Realizado"] = df_k_show["Realizado"].map(lambda x: f"{x:.2f}")
-                df_k_show["Diferença"] = df_k_show["Diferença"].map(lambda x: f"{x:.2f}")
-                kpi_table_html = df_k_show.to_html(index=False, classes="table-report", border=0)
+                    total_plan = sum(plan_vals)
+                    total_real_an = sum(real_vals)
+                    total_diff = total_plan - total_real_an
+                    pct_diff = ((total_diff / total_plan) * 100) if total_plan else 0.0
 
-                # escolher KPI principal (o primeiro)
-                kpi_names = list({k["nome"] for k in kpis})
-                kpi_sel_auto = kpi_names[0]
-                serie = [k for k in kpis if k["nome"] == kpi_sel_auto]
-                serie = sorted(serie, key=lambda x: x["mes"])
-                meses_k = [f"M{p['mes']}" for p in serie]
-                previstos_k = [p["previsto"] for p in serie]
-                realizados_k = [p["realizado"] for p in serie]
-
-                figk = go.Figure()
-                figk.add_trace(go.Scatter(x=meses_k, y=previstos_k, mode='lines+markers', name='Previsto', line=dict(color='#0d47a1')))
-                figk.add_trace(go.Scatter(x=meses_k, y=realizados_k, mode='lines+markers', name='Realizado', line=dict(color='#2ecc71')))
-                figk.update_layout(template='plotly_white', height=340, margin=dict(t=30), yaxis_title='Valor')
-                kpi_plot_html = pio.to_html(figk, include_plotlyjs='cdn', full_html=False)
-
-                # sugestão KPI
-                ratios = []
-                for pv, rl in zip(previstos_k, realizados_k):
-                    try:
-                        if pv and pv != 0:
-                            ratios.append(rl / pv)
-                    except Exception:
-                        continue
-                avg_ratio = sum(ratios) / len(ratios) if ratios else 0.0
-                if avg_ratio >= 0.95:
-                    sugestao_kpi = "Desempenho do KPI muito bom — metas sendo atingidas."
-                elif avg_ratio >= 0.8:
-                    sugestao_kpi = "KPI aceitável, mas atenção às variações mensais."
-                else:
-                    sugestao_kpi = "KPI abaixo do esperado — investigar causas (recursos/qualidade)."
-            except Exception:
-                kpi_table_html = "<p>Não foi possível gerar tabela/Gráfico de KPIs.</p>"
-                kpi_plot_html = ""
-                sugestao_kpi = "Erro ao gerar análise de KPI."
-
-        # Riscos e Plano de Ação
-        risks_html = "<p>Não há riscos cadastrados.</p>"
-        if risks:
-            df_r_show = pd.DataFrame(risks)[["descricao","impacto","prob","indice","resposta"]].copy()
-            df_r_show.columns = ["Risco","Impacto","Probabilidade","Índice","Resposta"]
-            risks_html = df_r_show.to_html(index=False, classes="table-report", border=0)
-        action_html = "<p>Não há ações no plano.</p>"
-        if action_plan:
-            df_ap = pd.DataFrame(action_plan)[["descricao","responsavel","status","prazo","risco_relacionado"]].copy()
-            df_ap.columns = ["Ação","Responsável","Status","Prazo","Risco relacionado"]
-            action_html = df_ap.to_html(index=False, classes="table-report", border=0)
-
-        # Gantt colorido: concluído verde, atraso vermelho, pendente azul
-        gantt_html = ""
-        try:
-            if eapTasks and tap.get("dataInicio"):
-                tasks_cpm, projeto_fim = calcular_cpm(eapTasks)
-                data_inicio_dt = datetime.strptime(tap["dataInicio"], "%Y-%m-%d").date()
-                rows = []
-                hoje = date.today()
-                for t in tasks_sched:
-                    es = int(t.get("es", 0))
-                    ef = int(t.get("ef", 0))
-                    start = data_inicio_dt + timedelta(days=es)
-                    # terminar no último dia (ef-1) ou ef? para plot, usar ef-1 para terminar no dia anterior? manter ef
-                    finish = data_inicio_dt + timedelta(days=max(ef, es+1))
-                    status_t = t.get("status", "")
-                    # avaliar atraso
-                    if status_t == "concluido":
-                        estado = "concluido"
+                    # ── Parecer ──
+                    if abs(pct_diff) <= 5:
+                        parecer = f"✅ **Planejamento ASSERTIVO** — Diferença de {pct_diff:.1f}% entre custo planejado e realizado."
+                    elif pct_diff > 5:
+                        parecer = f"⚠️ **Planejamento SUPERESTIMADO** — Custo realizado {abs(pct_diff):.1f}% abaixo do planejado. Sobra de orçamento."
                     else:
-                        fim_prev = data_inicio_dt + timedelta(days=ef)
-                        estado = "atrasado" if fim_prev < hoje else "pendente"
-                    rows.append({
-                        "Task": f"{t.get('codigo')} - {t.get('descricao')}",
-                        "Start": start,
-                        "Finish": finish,
-                        "Responsável": t.get("responsavel",""),
-                        "Estado": estado
+                        parecer = f"🔴 **Planejamento SUBESTIMADO** — Custo realizado {abs(pct_diff):.1f}% acima do planejado. Estouro de orçamento."
+
+                    st.markdown(f"#### Parecer de Custos")
+                    st.markdown(parecer)
+
+                    # ── Métricas ──
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("Total Planejado", format_currency_br(total_plan))
+                    mc2.metric("Total Realizado", format_currency_br(total_real_an))
+                    mc3.metric("Diferença", format_currency_br(total_diff))
+                    mc4.metric("Variação %", f"{pct_diff:.1f}%")
+
+                    # ── Tabela estilo Excel ──
+                    st.markdown("#### Tabela Planejado × Realizado (mensal)")
+                    df_tabela = pd.DataFrame({
+                        "Mês": months_an + ["**TOTAL**"],
+                        "Planejado (R$)": [format_currency_br(v) for v in plan_vals] + [format_currency_br(total_plan)],
+                        "Realizado (R$)": [format_currency_br(v) for v in real_vals] + [format_currency_br(total_real_an)],
+                        "Diferença (R$)": [format_currency_br(v) for v in diff_vals] + [format_currency_br(total_diff)],
+                        "Acum. Planejado": [format_currency_br(v) for v in plan_acum] + [format_currency_br(plan_acum[-1] if plan_acum else 0)],
+                        "Acum. Realizado": [format_currency_br(v) for v in real_acum] + [format_currency_br(real_acum[-1] if real_acum else 0)],
                     })
-                if rows:
-                    dfg = pd.DataFrame(rows)
-                    color_map = {"concluido": "#2ecc71", "atrasado": "#e74c3c", "pendente": "#3498db"}
-                    fig_gantt = px.timeline(dfg, x_start="Start", x_end="Finish", y="Task", color="Estado",
-                                            color_discrete_map=color_map, hover_data=["Responsável"])
-                    fig_gantt.update_yaxes(autorange="reversed")
-                    fig_gantt.update_layout(template='plotly_white', height=520, margin=dict(l=20, r=20, t=50, b=40))
-                    gantt_html = pio.to_html(fig_gantt, include_plotlyjs='cdn', full_html=False)
-            else:
-                gantt_html = "<p>Gantt indisponível — defina EAP e data de início.</p>"
-        except Exception:
-            gantt_html = "<p>Erro ao gerar Gantt.</p>"
+                    st.dataframe(df_tabela, use_container_width=True, height=400)
 
-        lessons_html = (pd.DataFrame(lessons)[['titulo','fase','categoria','descricao','recomendacao']].to_html(index=False, classes='table-report') if lessons else '<p>Não há lições registradas.</p>')
+                    # ── Gráfico de Barras — Fluxo de Caixa Mensal ──
+                    st.markdown("#### Fluxo de Caixa Mensal (Barras)")
+                    fig_bar = go.Figure()
+                    fig_bar.add_trace(go.Bar(x=months_an, y=plan_vals, name='Planejado',
+                                             marker_color='#3498db', opacity=0.7))
+                    fig_bar.add_trace(go.Bar(x=months_an, y=real_vals, name='Realizado',
+                                             marker_color='#e74c3c', opacity=0.7))
+                    fig_bar.update_layout(barmode='group', template='plotly_dark', height=380,
+                                           xaxis_title='Mês', yaxis_title='Valor (R$)',
+                                           margin=dict(l=30, r=20, t=35, b=30))
+                    st.plotly_chart(fig_bar, use_container_width=True, key="fin_analise_bar")
 
-        # ── Organograma EAP (HTML para relatório) ──────────────────
-        org_html = gerar_organograma_eap_html(eapTasks, nome_projeto=tap.get("nome") or "Projeto")
+                    # ── Gráfico de Linhas — Acumulado ──
+                    st.markdown("#### Custo Acumulado (Linhas)")
+                    fig_line = go.Figure()
+                    fig_line.add_trace(go.Scatter(x=months_an, y=plan_acum, mode='lines+markers',
+                                                   name='Planejado Acumulado',
+                                                   line=dict(color='#0d47a1', width=2.5)))
+                    fig_line.add_trace(go.Scatter(x=months_an, y=real_acum, mode='lines+markers',
+                                                   name='Realizado Acumulado',
+                                                   line=dict(color='#e74c3c', width=2.5)))
+                    fig_line.update_layout(template='plotly_dark', height=380,
+                                            xaxis_title='Mês', yaxis_title='Valor Acumulado (R$)',
+                                            margin=dict(l=30, r=20, t=35, b=30))
+                    st.plotly_chart(fig_line, use_container_width=True, key="fin_analise_acum")
 
-        # ── Curva S trabalho planejado×realizado (HTML) ─────────────
-        curva_s_html = "<p>Curva S indisponível — defina data de início e EAP.</p>"
-        try:
-            if eapTasks and tap.get("dataInicio"):
-                fig_cs = gerar_curva_s_trabalho(eapTasks, tap["dataInicio"])
-                if fig_cs:
-                    curva_s_html = pio.to_html(fig_cs, include_plotlyjs="cdn", full_html=False)
-        except Exception:
-            pass
+                    # ── Gráfico de Barras — Diferença ──
+                    st.markdown("#### Diferença Planejado - Realizado por Mês")
+                    colors_diff = ['#2ecc71' if d >= 0 else '#e74c3c' for d in diff_vals]
+                    fig_diff = go.Figure()
+                    fig_diff.add_trace(go.Bar(x=months_an, y=diff_vals,
+                                              marker_color=colors_diff, name='Diferença'))
+                    fig_diff.update_layout(template='plotly_dark', height=320,
+                                            xaxis_title='Mês', yaxis_title='Diferença (R$)',
+                                            margin=dict(l=30, r=20, t=35, b=30))
+                    fig_diff.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
+                    st.plotly_chart(fig_diff, use_container_width=True, key="fin_analise_diff")
 
-        # ── Gantt planejado×realizado % avanço (HTML) ─────────────
-        gantt_pr_html = "<p>Gantt indisponível — defina EAP e data de início.</p>"
-        try:
-            if eapTasks and tap.get("dataInicio"):
-                fig_gantt_pr = gerar_gantt(eapTasks, tap["dataInicio"])
-                if fig_gantt_pr:
-                    gantt_pr_html = pio.to_html(fig_gantt_pr, include_plotlyjs="cdn", full_html=False)
-        except Exception:
-            pass
+                else:
+                    st.warning("Não foi possível gerar a análise para o período informado.")
+            except Exception as e:
+                st.error(f"Erro ao gerar análise financeira: {e}")
+    else:
+        st.info("Nenhum lançamento financeiro cadastrado. Vá até a aba 'Lançamentos Financeiros' para adicionar custos.")
 
-        # Montar HTML completo
-        html_corpo = f"""
-        <div class="container">
-          <div class="header">
-            <div>
-                <div class="title">Relatório Completo do Projeto</div>
-                <div class="subtitle">Projeto: {tap.get('nome','')} — ID {st.session_state.current_project_id}</div>
-            </div>
-            <div class="badge">Relatório Completo</div>
-          </div>
 
-          <div style="padding:18px;">
-            <h3 class="section-title">1. Identificação e TAP</h3>
-            <p><strong>Gerente:</strong> {tap.get('gerente','')} &nbsp;&nbsp; <strong>Patrocinador:</strong> {tap.get('patrocinador','')}</p>
-            <p><strong>Data de início:</strong> {tap.get('dataInicio','')} &nbsp;&nbsp; <strong>Status:</strong> {tap.get('status','rascunho')}</p>
-
-            <h3 class="section-title">2. Objetivo e Escopo</h3>
-            <p><strong>Objetivo:</strong><br>{tap.get('objetivo','').replace(chr(10),'<br>')}</p>
-            <p><strong>Escopo inicial:</strong><br>{tap.get('escopo','').replace(chr(10),'<br>')}</p>
-
-            <h3 class="section-title">3. Resumo de números</h3>
-            <div class="report-grid">
-                <div class="report-card"><strong>Atividades na EAP</strong><div style="margin-top:8px">{qtd_eap}</div></div>
-                <div class="report-card"><strong>Lançamentos financeiros</strong><div style="margin-top:8px">{qtd_fin}</div></div>
-                <div class="report-card"><strong>Pontos de KPI</strong><div style="margin-top:8px">{qtd_kpi}</div></div>
-                <div class="report-card"><strong>Riscos</strong><div style="margin-top:8px">{qtd_risk}</div></div>
-                <div class="report-card"><strong>Lições</strong><div style="margin-top:8px">{qtd_les}</div></div>
-            </div>
-
-            <h3 class="section-title">4. Estrutura Analítica do Projeto (EAP)</h3>
-            <h4 class="section-title">4.1 Organograma Hierárquico (PMBOK)</h4>
-            <div>{org_html}</div>
-            <h4 class="section-title" style="margin-top:14px;">4.2 Tabela da EAP</h4>
-            {html_eap}
-
-            <h3 class="section-title">5. Cronograma e Avanço Físico</h3>
-            <h4 class="section-title">5.1 Curva S de Trabalho — Planejado × Realizado</h4>
-            <div>{curva_s_html}</div>
-            <h4 class="section-title" style="margin-top:14px;">5.2 Gráfico de Gantt — % Avanço por Atividade</h4>
-            <div>{gantt_pr_html}</div>
-            <h4 class="section-title" style="margin-top:14px;">5.3 Gantt — Status (Concluído / Atrasado / Pendente)</h4>
-            <div>{gantt_html}</div>
-
-            <h3 class="section-title">6. Resultados Financeiros (Previsto x Realizado)</h3>
-            <div class="report-grid">
-                <div class="report-card">
-                    <strong>Resumo financeiro</strong>
-                    <div style="margin-top:8px;">Total Previsto (acum): <strong>{format_currency_br(total_previsto_final)}</strong><br>
-                    Total Realizado (acum): <strong>{format_currency_br(total_realizado_final)}</strong><br>
-                    Saldo: <strong>{format_currency_br(total_previsto_final - total_realizado_final)}</strong></div>
-                </div>
-                <div class="report-card">
-                    <strong>Análise rápida do fluxo</strong>
-                    <p class="small-note">{sugestao_fluxo}</p>
-                </div>
-            </div>
-
-            <div style="margin-top:12px;">
-              <h4 class="section-title">Fluxo de Caixa (interativo)</h4>
-              <div class="report-grid">
-                <div class="report-card">{fig_flux_rel_html}</div>
-                <div class="report-card">{diff_html}</div>
-              </div>
-              <h4 class="section-title" style="margin-top:12px;">Fluxo por mês - Entrada x Saída</h4>
-              <div>{fluxo_por_mes_html}</div>
-            </div>
-
-            <h3 class="section-title" style="margin-top:10px;">7. KPIs (Previstos x Realizados)</h3>
-            <div class="report-grid">
-                <div class="report-card">
-                    <strong>Tabela de KPIs</strong>
-                    <div style="margin-top:8px;">{kpi_table_html}</div>
-                </div>
-                <div class="report-card">
-                    <strong>Gráfico KPI principal</strong>
-                    <div style="margin-top:8px;">{kpi_plot_html}</div>
-                    <p class="small-note">{sugestao_kpi}</p>
-                </div>
-            </div>
-
-            <h3 class="section-title">8. Riscos</h3>
-            {risks_html}
-
-            <h3 class="section-title">9. Plano de Ação</h3>
-            {action_html}
-
-            
-            <div>{gantt_html}</div>
-
-            <h3 class="section-title">10. Lições Aprendidas</h3>
-            {lessons_html}
-
-            <h3 class="section-title">11. Encerramento</h3>
-            <p><strong>Resumo executivo:</strong><br>{close_data.get('resumo','').replace(chr(10),'<br>')}</p>
-            <p><strong>Resultados alcançados:</strong><br>{close_data.get('resultados','').replace(chr(10),'<br>')}</p>
-
-          </div>
-          <div class="footer">Relatório gerado em {datetime.now().strftime("%d/%m/%Y %H:%M")} — BK Engenharia</div>
-        </div>
-        """
-
-        # Exibe no app
-        components.html(REPORT_CSS + html_corpo, height=1100, scrolling=True)
-        # Prepara download (HTML completo)
-        html_completo = montar_html_completo(html_corpo)
-        st.download_button("⬇️ Baixar relatório em HTML", data=html_completo.encode("utf-8"),
-                           file_name="relatorio_completo_projeto.html", mime="text/html")
-
-        # Gráficos interativos adicionais abaixo (mantidos)
-        st.markdown("#### 📈 Curva S de trabalho")
-        if eapTasks and tap.get("dataInicio"):
-            fig_s = gerar_curva_s_trabalho(eapTasks, tap["dataInicio"])
-            if fig_s:
-                st.plotly_chart(fig_s, width='stretch', key="curva_s_trabalho_relatorio")
-        else:
-            st.caption("Curva S de trabalho indisponível - verifique EAP e data de início.")
-
-        st.markdown("#### 💹 Curva S Financeira (Previsto x Realizado)")
-        if df_fluxo_rel is not None and 'Previsto (acumulado)' in df_fluxo_rel.columns:
-            # montar fig_flux novamente para app (cores claros)
-            fig_flux_app = go.Figure()
-            fig_flux_app.add_trace(go.Scatter(x=df_fluxo_rel["Mês"], y=df_fluxo_rel["Previsto (acumulado)"], mode='lines+markers', name='Previsto', line=dict(color='#0d47a1')))
-            fig_flux_app.add_trace(go.Scatter(x=df_fluxo_rel["Mês"], y=df_fluxo_rel["Realizado (acumulado)"], mode='lines+markers', name='Realizado', line=dict(color='#2ecc71')))
-            fig_flux_app.update_layout(template='plotly_dark', height=350, margin=dict(l=30, r=20, t=35, b=30))
-            st.plotly_chart(fig_flux_app, width='stretch', key="curva_s_financeira_report")
-        else:
-            if finances:
-                st.caption("Curva S financeira indisponível para o período calculado (verifique data de início ou EAP).")
-            else:
-                st.caption("Curva S financeira indisponível - não há lançamentos.")
-
-        st.markdown("#### 📊 KPI principal")
-        if kpis:
-            kpi_names = list({k["nome"] for k in kpis})
-            kpi_sel_auto = kpi_names[0]
-            serie = [k for k in kpis if k["nome"] == kpi_sel_auto]
-            serie = sorted(serie, key=lambda x: x["mes"])
-            df_plot = pd.DataFrame({
-                "Mês": [f"M{p['mes']}" for p in serie],
-                "Previsto": [p["previsto"] for p in serie],
-                "Realizado": [p["realizado"] for p in serie],
-            })
-            fig_kpi = go.Figure()
-            fig_kpi.add_trace(go.Scatter(x=df_plot["Mês"], y=df_plot["Previsto"], mode='lines+markers', name='Previsto', line=dict(color='#0d47a1')))
-            fig_kpi.add_trace(go.Scatter(x=df_plot["Mês"], y=df_plot["Realizado"], mode='lines+markers', name='Realizado', line=dict(color='#2ecc71')))
-            fig_kpi.update_layout(template='plotly_dark', height=350, margin=dict(l=30, r=20, t=35, b=30))
-            st.plotly_chart(fig_kpi, width='stretch', key="kpi_chart_report")
-        else:
-            st.caption("Não há KPIs para exibir no relatório completo.")
 # --------------------------------------------------------
 # TAB 9 - PLANO DE AÇÃO
 # --------------------------------------------------------
